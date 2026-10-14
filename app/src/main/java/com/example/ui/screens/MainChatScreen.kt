@@ -1053,7 +1053,7 @@ fun MainChatScreen(
                     state = audioPlayerState,
                     onTogglePlayPause = { viewModel.audioManager.togglePlayPause() },
                     onSeek = { fraction -> viewModel.audioManager.seekToFraction(fraction) },
-                    onClose = { viewModel.audioManager.stopPlayback() },
+                    onClose = { viewModel.stopSpeech() },
                     modifier = Modifier.align(Alignment.TopCenter)
                 )
 

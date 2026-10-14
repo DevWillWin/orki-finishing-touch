@@ -5,6 +5,7 @@ import android.media.MediaPlayer
 import android.media.MediaRecorder
 import android.os.Build
 import android.util.Base64
+import android.util.Log
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -16,6 +17,7 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.io.File
 import java.io.FileInputStream
+import java.security.MessageDigest
 
 data class AudioPlayerState(
     val isVisible: Boolean = false,
@@ -30,6 +32,10 @@ class AudioManager(
     private val context: Context,
     private val scope: CoroutineScope
 ) {
+    private companion object {
+        const val TAG = "AudioManager"
+    }
+
     private var mediaRecorder: MediaRecorder? = null
     private var mediaPlayer: MediaPlayer? = null
     private var recordFile: File? = null
@@ -72,6 +78,50 @@ class AudioManager(
         } catch (e: Exception) {
             e.printStackTrace()
             null
+        }
+    }
+
+    /**
+     * Cache file for an offline (neural) synthesis. Voice, speed and text all take part in the name
+     * (the previous name ignored speed and used a 32-bit hash), so different settings never collide.
+     * Touches storage: call off the main thread.
+     */
+    fun neuralTtsFile(voice: String, speed: Float, text: String): File {
+        val digest = MessageDigest.getInstance("SHA-256")
+            .digest("$voice|$speed|${text.trim()}".toByteArray(Charsets.UTF_8))
+        val key = digest.take(8).joinToString("") { "%02x".format(it) }
+        return File(ttsDiskCacheDir, "tts_neural_$key.wav")
+    }
+
+    /** True for a local audio path that still exists (cache entries can be wiped by the OS). */
+    fun isLocalAudioUsable(path: String): Boolean = try {
+        File(path).let { it.isFile && it.length() > 44L }
+    } catch (_: Exception) {
+        false
+    }
+
+    /**
+     * Keeps the offline-TTS cache bounded: at most [maxFiles] / [maxBytes] of `tts_neural_*.wav`
+     * (oldest first) and no abandoned `.part` files. Touches storage: call off the main thread.
+     */
+    fun trimNeuralTtsCache(maxFiles: Int = 24, maxBytes: Long = 64L * 1024 * 1024) {
+        try {
+            val now = System.currentTimeMillis()
+            val all = ttsDiskCacheDir.listFiles() ?: return
+            all.filter { it.isFile && it.name.startsWith("tts_neural_") && it.name.endsWith(".part") && now - it.lastModified() > 10 * 60_000L }
+                .forEach { it.delete() }
+            val wavs = all.filter { it.isFile && it.name.startsWith("tts_neural_") && it.name.endsWith(".wav") }
+                .sortedByDescending { it.lastModified() }
+            var total = 0L
+            wavs.forEachIndexed { index, file ->
+                total += file.length()
+                if (index >= maxFiles || total > maxBytes) {
+                    // ttsUrlCache is main-thread state; stale entries are rejected by isLocalAudioUsable().
+                    file.delete()
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Could not trim the offline TTS cache", e)
         }
     }
 
@@ -292,6 +342,7 @@ class AudioManager(
         ttsText: String? = null,
         pitch: Float = 1.0f,
         speed: Float = 1.0f,
+        onError: ((String) -> Unit)? = null,
         onCompleted: (() -> Unit)? = null
     ) {
         stopPlayback()
@@ -344,7 +395,10 @@ class AudioManager(
                 setOnCompletionListener {
                     handlePlaybackEnded()
                 }
-                setOnErrorListener { _, _, _ ->
+                setOnErrorListener { _, what, extra ->
+                    // Previously swallowed silently; keep the code path but make it diagnosable.
+                    Log.w(TAG, "MediaPlayer error what=$what extra=$extra (source kind=${if (url.startsWith("http")) "remote" else "local"})")
+                    onError?.invoke("Audio playback failed (code $what/$extra).")
                     handlePlaybackEnded()
                     true
                 }
@@ -352,7 +406,8 @@ class AudioManager(
             }
             mediaPlayer = player
         } catch (e: Exception) {
-            e.printStackTrace()
+            Log.w(TAG, "Could not start audio playback", e)
+            onError?.invoke("Audio playback could not start (${e.javaClass.simpleName}).")
             handlePlaybackEnded()
         }
     }

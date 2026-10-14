@@ -2,45 +2,86 @@ package com.example.data.audio
 
 import android.content.Context
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
+import java.io.IOException
 import java.net.HttpURLConnection
-import java.net.URL
 import java.security.MessageDigest
 
 /**
  * Manages the optional offline Bodo Neural TTS Voice Pack.
  *
- * Keeps the base APK compact by maintaining the ~117 MB neural model
- * as a separate verified voice pack stored in app-private storage.
+ * Keeps the base APK compact by maintaining the ~123 MB neural model as a separate verified voice
+ * pack stored in app-private storage.
+ *
+ * Integrity model: the download URLs are pinned to an immutable Hugging Face *commit* (not the moving
+ * `main` ref) whose `model.onnx` has the pinned size and SHA-256 below (checked against the Hub's
+ * LFS metadata). The digest is computed while streaming, and files are installed only after every
+ * check passed, so a failed or truncated re-download can never replace a working pack.
  */
-class BodoVoicePackManager(private val context: Context) {
+class BodoVoicePackManager(
+    private val baseDirProvider: () -> File,
+    private val sources: Sources = Sources.DEFAULT
+) {
+
+    constructor(context: Context) : this({ context.filesDir })
+
+    /** Where to download from and what to expect; overridable for tests. */
+    class Sources(
+        val modelUrl: String,
+        val tokensUrl: String,
+        val modelSize: Long,
+        val modelSha256: String,
+        val tokensSize: Long,
+        val minFreeBytes: Long = EXTRA_FREE_SPACE_BYTES
+    ) {
+        companion object {
+            val DEFAULT = Sources(
+                modelUrl = MODEL_DOWNLOAD_URL,
+                tokensUrl = TOKENS_DOWNLOAD_URL,
+                modelSize = EXPECTED_MODEL_SIZE,
+                modelSha256 = EXPECTED_MODEL_SHA256,
+                tokensSize = EXPECTED_TOKENS_SIZE
+            )
+        }
+    }
 
     companion object {
         const val VOICE_PACK_DIR_NAME = "bodo_tts_pack"
         const val MODEL_FILE_NAME = "model.onnx"
         const val TOKENS_FILE_NAME = "tokens.txt"
+        const val GUARD_FILE_NAME = "engine_guard"
 
-        // Legitimate Hugging Face repository URLs (ai4bharat / sherpa-onnx compatible export)
+        /** Immutable Hub revision of MatiasLin/sherpa-onnx-vits-rasa-13 that the constants below describe. */
+        const val PINNED_REVISION = "b5afd4e991e3bdd6195528de650e2ed219d47506"
+
         const val MODEL_DOWNLOAD_URL =
-            "https://huggingface.co/MatiasLin/sherpa-onnx-vits-rasa-13/resolve/main/model.onnx"
+            "https://huggingface.co/MatiasLin/sherpa-onnx-vits-rasa-13/resolve/$PINNED_REVISION/model.onnx"
         const val TOKENS_DOWNLOAD_URL =
-            "https://huggingface.co/MatiasLin/sherpa-onnx-vits-rasa-13/resolve/main/tokens.txt"
+            "https://huggingface.co/MatiasLin/sherpa-onnx-vits-rasa-13/resolve/$PINNED_REVISION/tokens.txt"
 
-        // Verified SHA-256 checksums for tamper detection
+        // Verified against the Hub tree API (LFS oid / size) for the pinned revision.
         const val EXPECTED_MODEL_SHA256 =
             "4473f8d0b6f738196c1626bbf337cda99b34749b638bb7234c4cb8e1992bf804"
-        const val EXPECTED_TOKENS_SHA256 =
-            "32ad56b2533484ccd61f8c783cc32b1f90ae06e65469476548c2f832eb6d3a9c"
-
         const val EXPECTED_MODEL_SIZE = 123338635L
-        const val EXPECTED_TOKENS_SIZE = 9606L
+        const val EXPECTED_TOKENS_SIZE = 9556L
+
+        /** Headroom on top of the download itself (temp file + tokens + filesystem slack). */
+        const val EXTRA_FREE_SPACE_BYTES = 64L * 1024 * 1024
+
+        private const val MIN_MODEL_BYTES = 100_000_000L
+        private const val MIN_TOKENS_BYTES = 5000L
     }
 
+    private val rootDir: File get() = baseDirProvider()
+
+    /** Pure accessor: nothing is created until files are actually written. */
     val voicePackDir: File
-        get() = File(context.filesDir, VOICE_PACK_DIR_NAME).apply { mkdirs() }
+        get() = File(rootDir, VOICE_PACK_DIR_NAME)
 
     val modelFile: File
         get() = File(voicePackDir, MODEL_FILE_NAME)
@@ -48,31 +89,34 @@ class BodoVoicePackManager(private val context: Context) {
     val tokensFile: File
         get() = File(voicePackDir, TOKENS_FILE_NAME)
 
+    /** Crash-sentinel location used by the engine (see [EngineGuard]). */
+    val guardFile: File
+        get() = File(voicePackDir, GUARD_FILE_NAME)
+
     /**
-     * Checks if the voice pack files exist and match the expected sizes.
+     * Cheap structural check (two `stat` calls): both files exist and have plausible sizes.
+     * Content integrity is enforced at download time and again by the engine when loading.
      */
     fun isVoicePackInstalled(): Boolean {
-        return modelFile.exists() && modelFile.length() > 100_000_000L &&
-                tokensFile.exists() && tokensFile.length() > 5000L
+        val model = modelFile
+        val tokens = tokensFile
+        return model.isFile && model.length() > MIN_MODEL_BYTES && tokens.isFile && tokens.length() > MIN_TOKENS_BYTES
     }
 
     /**
-     * Verifies the SHA-256 cryptographic checksums of the installed model artifacts.
+     * Full verification of the installed model (reads the whole file; call off the main thread).
+     * The tokens file is validated structurally by the engine (symbol table parse), not by hash.
      */
     fun verifyChecksums(): Boolean {
-        if (!isVoicePackInstalled()) return false
-        val modelHash = computeSha256(modelFile)
-        val tokensHash = computeSha256(tokensFile)
-        return modelHash.equals(EXPECTED_MODEL_SHA256, ignoreCase = true) &&
-                tokensHash.equals(EXPECTED_TOKENS_SHA256, ignoreCase = true)
+        val model = modelFile
+        if (!model.isFile || model.length() != sources.modelSize) return false
+        return computeSha256(model).equals(sources.modelSha256, ignoreCase = true)
     }
 
-    /**
-     * Installs or links the voice pack from local files.
-     */
+    /** Installs or links the voice pack from local files. */
     fun installFromLocalFiles(srcModel: File, srcTokens: File): Boolean {
         return try {
-            if (!voicePackDir.exists()) voicePackDir.mkdirs()
+            voicePackDir.mkdirs()
             srcModel.copyTo(modelFile, overwrite = true)
             srcTokens.copyTo(tokensFile, overwrite = true)
             isVoicePackInstalled()
@@ -83,37 +127,55 @@ class BodoVoicePackManager(private val context: Context) {
     }
 
     /**
-     * Downloads the neural model and token vocabulary with progress reporting.
+     * Downloads and verifies the neural model and token vocabulary with progress reporting. Existing
+     * files are replaced only after both downloads verified. Cancellation-aware.
      */
     suspend fun downloadVoicePack(
         onProgress: (progress: Float, statusMessage: String) -> Unit
     ): Result<Unit> = withContext(Dispatchers.IO) {
+        val dir = voicePackDir
+        val tokensTemp = File(dir, "$TOKENS_FILE_NAME.downloading")
+        val modelTemp = File(dir, "$MODEL_FILE_NAME.downloading")
+        var installed = false
         try {
-            voicePackDir.mkdirs()
+            dir.mkdirs()
+            val needed = sources.modelSize + sources.tokensSize + sources.minFreeBytes
+            if (dir.usableSpace in 1 until needed) {
+                return@withContext Result.failure(
+                    IOException("Not enough free storage: about ${needed / (1024 * 1024)} MB are needed.")
+                )
+            }
 
-            // 1. Download tokens.txt
             onProgress(0.02f, "Downloading Bodo vocabulary (tokens.txt)...")
-            downloadFileWithProgress(TOKENS_DOWNLOAD_URL, tokensFile) { _, _ -> }
+            downloadVerified(sources.tokensUrl, tokensTemp, sources.tokensSize, expectedSha256 = null) { _, _ -> }
 
-            // 2. Download model.onnx with detailed progress
-            onProgress(0.05f, "Downloading Bodo Neural TTS model (117 MB)...")
-            downloadFileWithProgress(MODEL_DOWNLOAD_URL, modelFile) { bytesRead, totalBytes ->
+            val modelMb = sources.modelSize / (1024 * 1024)
+            onProgress(0.05f, "Downloading Bodo Neural TTS model ($modelMb MB)...")
+            downloadVerified(sources.modelUrl, modelTemp, sources.modelSize, sources.modelSha256) { bytesRead, totalBytes ->
                 val progress = 0.05f + (bytesRead.toFloat() / totalBytes.coerceAtLeast(1L).toFloat()) * 0.90f
-                val mbRead = bytesRead / (1024 * 1024)
-                val mbTotal = totalBytes / (1024 * 1024)
-                onProgress(progress.coerceIn(0.05f, 0.95f), "Downloading model: ${mbRead}MB / ${mbTotal}MB...")
+                onProgress(
+                    progress.coerceIn(0.05f, 0.95f),
+                    "Downloading model: ${bytesRead / (1024 * 1024)}MB / ${totalBytes / (1024 * 1024)}MB..."
+                )
             }
 
-            // 3. Verify files
-            onProgress(0.96f, "Verifying model integrity...")
-            if (!isVoicePackInstalled()) {
-                return@withContext Result.failure(Exception("Downloaded voice pack files are incomplete."))
-            }
+            onProgress(0.97f, "Installing verified files...")
+            replaceFile(tokensTemp, tokensFile)
+            replaceFile(modelTemp, modelFile)
+            installed = true
+            guardFile.delete() // a fresh pack starts with a clean crash marker
 
             onProgress(1.0f, "Bodo Neural Voice Pack installed successfully!")
             Result.success(Unit)
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
         } catch (e: Exception) {
             Result.failure(e)
+        } finally {
+            if (!installed) {
+                tokensTemp.delete()
+                modelTemp.delete()
+            }
         }
     }
 
@@ -122,51 +184,76 @@ class BodoVoicePackManager(private val context: Context) {
             var deleted = true
             if (modelFile.exists()) deleted = deleted && modelFile.delete()
             if (tokensFile.exists()) deleted = deleted && tokensFile.delete()
+            guardFile.delete()
             deleted
         } catch (_: Exception) {
             false
         }
     }
 
-    private fun downloadFileWithProgress(
+    private fun replaceFile(temp: File, target: File) {
+        if (target.exists() && !target.delete()) throw IOException("Could not replace ${target.name}")
+        if (!temp.renameTo(target)) {
+            temp.copyTo(target, overwrite = true)
+            temp.delete()
+        }
+    }
+
+    /**
+     * Streams [sourceUrl] into [tempFile], verifying exact size, Content-Length (when announced) and,
+     * if given, SHA-256 on the fly. On any mismatch the temp file is deleted and an IOException is thrown.
+     */
+    private suspend fun downloadVerified(
         sourceUrl: String,
-        targetFile: File,
+        tempFile: File,
+        expectedSize: Long,
+        expectedSha256: String?,
         onChunk: (bytesRead: Long, totalBytes: Long) -> Unit
     ) {
-        val tempFile = File(targetFile.parentFile, "${targetFile.name}.downloading")
-        val url = URL(sourceUrl)
-        val conn = url.openConnection() as HttpURLConnection
+        val conn = java.net.URI(sourceUrl).toURL().openConnection() as HttpURLConnection
         conn.connectTimeout = 30000
         conn.readTimeout = 60000
         conn.instanceFollowRedirects = true
-
+        val digest = expectedSha256?.let { MessageDigest.getInstance("SHA-256") }
+        var ok = false
         try {
             conn.connect()
             if (conn.responseCode !in 200..299) {
-                throw Exception("HTTP ${conn.responseCode} while downloading $sourceUrl")
+                throw IOException("HTTP ${conn.responseCode} while downloading ${File(java.net.URI(sourceUrl).path).name}")
             }
-
-            val totalBytes = conn.contentLengthLong
+            val announced = conn.contentLengthLong
+            if (announced >= 0 && announced != expectedSize) {
+                throw IOException("Unexpected download size ($announced bytes, expected $expectedSize).")
+            }
             conn.inputStream.use { input ->
                 FileOutputStream(tempFile).use { output ->
                     val buffer = ByteArray(65536)
-                    var bytesRead: Int
                     var totalRead = 0L
-                    while (input.read(buffer).also { bytesRead = it } != -1) {
-                        output.write(buffer, 0, bytesRead)
-                        totalRead += bytesRead
-                        onChunk(totalRead, totalBytes)
+                    while (true) {
+                        currentCoroutineContext().ensureActive()
+                        val n = input.read(buffer)
+                        if (n == -1) break
+                        output.write(buffer, 0, n)
+                        digest?.update(buffer, 0, n)
+                        totalRead += n
+                        if (totalRead > expectedSize) throw IOException("Download is larger than expected.")
+                        onChunk(totalRead, expectedSize)
                     }
                 }
             }
-
-            if (tempFile.exists()) {
-                if (targetFile.exists()) targetFile.delete()
-                tempFile.renameTo(targetFile)
+            if (tempFile.length() != expectedSize) {
+                throw IOException("Download is incomplete (${tempFile.length()} of $expectedSize bytes). Please retry.")
             }
+            if (digest != null) {
+                val actual = digest.digest().joinToString("") { "%02x".format(it) }
+                if (!actual.equals(expectedSha256, ignoreCase = true)) {
+                    throw IOException("Integrity check failed: the downloaded file does not match the expected checksum.")
+                }
+            }
+            ok = true
         } finally {
             conn.disconnect()
-            if (tempFile.exists()) tempFile.delete()
+            if (!ok) tempFile.delete()
         }
     }
 
@@ -174,8 +261,9 @@ class BodoVoicePackManager(private val context: Context) {
         val md = MessageDigest.getInstance("SHA-256")
         FileInputStream(file).use { fis ->
             val buf = ByteArray(65536)
-            var n: Int
-            while (fis.read(buf).also { n = it } != -1) {
+            while (true) {
+                val n = fis.read(buf)
+                if (n == -1) break
                 md.update(buf, 0, n)
             }
         }

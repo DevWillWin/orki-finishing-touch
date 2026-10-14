@@ -8,6 +8,9 @@ import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.data.audio.AudioManager
+import com.example.data.audio.BodoNeuralTtsEngine
+import com.example.data.audio.BodoNeuralTtsEngineFactory
+import com.example.data.audio.TtsException
 import com.example.data.audio.AudioPlayerState
 import com.example.data.billing.PlayBillingManager
 import com.example.data.local.AppDatabase
@@ -40,6 +43,7 @@ import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.flow.onStart
 import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
@@ -127,7 +131,12 @@ class OrkiViewModel(application: Application) : AndroidViewModel(application) {
     val audioManager = AudioManager(application, viewModelScope)
 
     val voicePackManager by lazy { com.example.data.audio.BodoVoicePackManager(application) }
-    private var neuralEngine: com.example.data.audio.BodoNeuralTtsEngine? = null
+    private val neuralEngineLock = Any()
+    private var neuralEngine: BodoNeuralTtsEngine? = null
+
+    // The single in-flight speech request (offline synthesis or online fetch). A newer tap, the player's
+    // close button, a new chat, etc. cancel it so an old request can never start playing late.
+    private var ttsJob: Job? = null
 
     private val optionalServicesStarted = AtomicBoolean(false)
     private val activeUserEmailFlow = MutableStateFlow("")
@@ -305,7 +314,7 @@ class OrkiViewModel(application: Application) : AndroidViewModel(application) {
 
     fun startNewChat() {
         cancelGeneration()
-        audioManager.stopPlayback()
+        stopSpeech()
         _uiState.value = _uiState.value.copy(
             currentConversationId = null,
             messages = emptyList(),
@@ -316,7 +325,7 @@ class OrkiViewModel(application: Application) : AndroidViewModel(application) {
     fun selectConversation(id: String) {
         if (_uiState.value.isIncognito) return
         cancelGeneration()
-        audioManager.stopPlayback()
+        stopSpeech()
 
         activeConversationJob?.cancel()
         _uiState.value = _uiState.value.copy(
@@ -400,6 +409,7 @@ class OrkiViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun previewVoice(voiceId: String) {
+        ttsJob?.cancel() // a pending synthesis must not start playing over the preview
         val profile = VoiceOptions.get(voiceId)
         audioManager.playRawResource(
             resId = profile.rawResId,
@@ -428,7 +438,7 @@ class OrkiViewModel(application: Application) : AndroidViewModel(application) {
         prefs.currentPlan = userPlan
 
         cancelGeneration()
-        audioManager.stopPlayback()
+        stopSpeech()
         activeUserEmailFlow.value = cleanEmail
 
         val limit = prefs.getDailyLimit(userPlan)
@@ -456,7 +466,7 @@ class OrkiViewModel(application: Application) : AndroidViewModel(application) {
 
     fun signOut() {
         cancelGeneration()
-        audioManager.stopPlayback()
+        stopSpeech()
 
         prefs.hasExplicitlyLoggedIn = false
         prefs.isLoggedIn = false
@@ -980,7 +990,7 @@ class OrkiViewModel(application: Application) : AndroidViewModel(application) {
         if (_uiState.value.isGenerating) return
         if (!checkQuota()) return
 
-        audioManager.stopPlayback()
+        stopSpeech()
         val started = audioManager.startRecording(
             autoSilenceDetection = liveMode,
             onSilenceDetected = {
@@ -1290,15 +1300,15 @@ class OrkiViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    private fun getOrInitNeuralEngine(): com.example.data.audio.BodoNeuralTtsEngine? {
-        if (!voicePackManager.isVoicePackInstalled()) return null
-        if (neuralEngine == null) {
-            val engine = com.example.data.audio.BodoNeuralTtsEngine(voicePackManager.modelFile, voicePackManager.tokensFile)
-            if (engine.initialize()) {
-                neuralEngine = engine
-            }
-        }
-        return neuralEngine
+    /** Cheap, I/O-free: the engine loads its model lazily, off the main thread, on first use. */
+    private fun obtainNeuralEngine(): BodoNeuralTtsEngine = synchronized(neuralEngineLock) {
+        neuralEngine ?: BodoNeuralTtsEngineFactory.create(getApplication(), voicePackManager).also { neuralEngine = it }
+    }
+
+    /** Non-blocking: terminates any in-flight run and releases the session once it has finished. */
+    private fun discardNeuralEngine() {
+        val old = synchronized(neuralEngineLock) { neuralEngine.also { neuralEngine = null } }
+        old?.close()
     }
 
     fun setTtsEngineMode(mode: String) {
@@ -1321,6 +1331,7 @@ class OrkiViewModel(application: Application) : AndroidViewModel(application) {
                 )
             }
             res.onSuccess {
+                discardNeuralEngine() // new model files: drop any session/failure state tied to the old ones
                 _uiState.value = _uiState.value.copy(
                     isDownloadingVoicePack = false,
                     isVoicePackInstalled = true,
@@ -1336,120 +1347,171 @@ class OrkiViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    fun playTts(text: String, voice: String = _uiState.value.selectedVoice) {
-        val clean = OrkiApiService.cleanTextForTTS(text)
-        if (clean.isEmpty()) return
+    private class SpeechPlan(val clean: String, val packInstalled: Boolean)
 
-        val profile = VoiceOptions.get(voice)
+    private class OfflineSpeech(val path: String, val truncated: Boolean)
+
+    private fun isNeuralAudioPath(path: String): Boolean = path.contains("/tts_neural_")
+
+    private fun isRemoteAudio(url: String): Boolean = url.startsWith("http", ignoreCase = true) || url.startsWith("data:", ignoreCase = true)
+
+    private fun reportSpeechError(message: String) {
+        _uiState.value = _uiState.value.copy(errorMessage = message)
+    }
+
+    /** Text normalisation (regex heavy) and the voice-pack check run off the main thread. */
+    private suspend fun planSpeech(text: String): SpeechPlan = withContext(Dispatchers.IO) {
+        SpeechPlan(OrkiApiService.cleanTextForTTS(text), voicePackManager.isVoicePackInstalled())
+    }
+
+    /** A cached entry is reusable if its file still exists and, in strict offline mode, it is an offline WAV. */
+    private suspend fun isCachedAudioUsable(path: String, offlineStrict: Boolean): Boolean = withContext(Dispatchers.IO) {
+        when {
+            isRemoteAudio(path) -> !offlineStrict
+            isNeuralAudioPath(path) -> audioManager.isLocalAudioUsable(path)
+            else -> !offlineStrict && audioManager.isLocalAudioUsable(path)
+        }
+    }
+
+    /** Plays [path]; offline WAVs already have the speaking rate baked in, so they play at 1.0x. */
+    private fun playResolvedAudio(path: String, ttsText: String, pitch: Float, speed: Float, onCompleted: (() -> Unit)? = null) {
+        audioManager.playAudioUrl(
+            url = path,
+            ttsText = ttsText,
+            pitch = pitch,
+            speed = if (isNeuralAudioPath(path)) 1.0f else speed,
+            onError = { reportSpeechError(it) },
+            onCompleted = onCompleted
+        )
+    }
+
+    /**
+     * Offline synthesis on the engine's own dispatchers (IO for loading/files, a single compute thread
+     * for inference). Never throws except for cancellation; failures are [TtsException]s.
+     */
+    private suspend fun synthesizeOffline(clean: String, voice: String, speed: Float): Result<OfflineSpeech> = withContext(Dispatchers.IO) {
+        val target = audioManager.neuralTtsFile(voice, speed, clean)
+        if (audioManager.isLocalAudioUsable(target.absolutePath)) {
+            target.setLastModified(System.currentTimeMillis()) // keep recently used results in the bounded cache
+            return@withContext Result.success(OfflineSpeech(target.absolutePath, truncated = false))
+        }
+        val result = obtainNeuralEngine().synthesizeToWav(clean, voice, speed, target)
+        result.onSuccess { audioManager.trimNeuralTtsCache() }
+        result.map { OfflineSpeech(it.file.absolutePath, it.truncated) }
+    }
+
+    private fun describeOfflineFailure(error: Throwable): String =
+        (error as? TtsException)?.message ?: "The offline voice failed (${error.javaClass.simpleName})."
+
+    private fun notifyIfTruncated(speech: OfflineSpeech) {
+        if (speech.truncated) {
+            reportSpeechError("The offline voice reads the first part of very long replies; the rest was skipped.")
+        }
+    }
+
+    /** Stops playback and cancels any in-flight synthesis/fetch (rapid taps, close button, new chat). */
+    fun stopSpeech() {
+        ttsJob?.cancel()
+        ttsJob = null
+        audioManager.stopPlayback()
+    }
+
+    fun playTts(text: String, voice: String = _uiState.value.selectedVoice) {
         val speed = prefs.ttsSpeed
         val pitch = prefs.ttsPitch
-        val cacheKey = "$voice:$speed:$clean"
-
-        // 1. Check in-memory URL cache
-        val cachedUrl = audioManager.ttsUrlCache[cacheKey]
-        if (cachedUrl != null) {
-            audioManager.playAudioUrl(
-                url = cachedUrl,
-                ttsText = text,
-                pitch = pitch,
-                speed = speed
-            )
-            return
-        }
-
-        // 2. Check persistent disk cache (instant 0-latency playback)
-        val diskPath = audioManager.getCachedTtsPath(clean, voice)
-        if (diskPath != null) {
-            audioManager.ttsUrlCache[cacheKey] = diskPath
-            audioManager.playAudioUrl(
-                url = diskPath,
-                ttsText = text,
-                pitch = pitch,
-                speed = speed
-            )
-            return
-        }
-
         val mode = prefs.ttsEngineMode // "auto", "offline", "online"
-        val useOffline = when (mode) {
-            "offline" -> true
-            "auto" -> voicePackManager.isVoicePackInstalled()
-            else -> false
-        }
+        val offlineStrict = mode == "offline"
 
-        if (useOffline) {
-            if (!voicePackManager.isVoicePackInstalled()) {
-                if (mode == "offline") {
-                    // Strictly offline mode: NEVER call AWS silently!
-                    audioManager.stopPlayback()
-                    _uiState.value = _uiState.value.copy(
-                        errorMessage = "Offline voice pack is not installed. Download it in Settings to enable offline Bodo speech."
-                    )
-                    return
+        // Newest tap wins. setPlayerLoading() also stops whatever is playing and shows immediate feedback.
+        ttsJob?.cancel()
+        audioManager.setPlayerLoading(text)
+
+        ttsJob = viewModelScope.launch {
+            // Invariant: every exit either hands the request to the player (which owns the UI from then on)
+            // or stops the loading indicator below. A request cancelled by a newer one must not touch the UI.
+            var handedOff = false
+            try {
+                val plan = planSpeech(text)
+                val clean = plan.clean
+                if (clean.isEmpty()) return@launch
+                val cacheKey = "$voice:$speed:$clean"
+
+                // 1. In-memory cache
+                audioManager.ttsUrlCache[cacheKey]?.let { cached ->
+                    if (isCachedAudioUsable(cached, offlineStrict)) {
+                        handedOff = true
+                        playResolvedAudio(cached, text, pitch, speed)
+                        return@launch
+                    }
+                    audioManager.ttsUrlCache.remove(cacheKey)
                 }
-                // In auto mode, fallback to online below
-            } else {
-                viewModelScope.launch {
-                    audioManager.setPlayerLoading(text)
-                    try {
-                        val engine = getOrInitNeuralEngine()
-                        if (engine != null) {
-                            val outFile = java.io.File(getApplication<Application>().cacheDir, "tts_neural_${voice}_${clean.hashCode()}.wav")
-                            val res = engine.synthesizeToWav(clean, voice, speed, outFile)
-                            res.onSuccess { wavPath ->
-                                audioManager.ttsUrlCache[cacheKey] = wavPath
-                                audioManager.playAudioUrl(
-                                    url = wavPath,
-                                    ttsText = text,
-                                    pitch = pitch,
-                                    speed = speed
-                                )
-                            }.onFailure { err ->
-                                audioManager.stopPlayback()
-                                _uiState.value = _uiState.value.copy(
-                                    errorMessage = "Offline TTS error: ${err.message}"
-                                )
-                            }
-                            return@launch
-                        }
-                    } catch (e: Exception) {
-                        audioManager.stopPlayback()
-                        _uiState.value = _uiState.value.copy(
-                            errorMessage = "Neural TTS error: ${e.message}"
-                        )
+
+                // 2. Persistent disk cache of online results (never consulted in strict offline mode)
+                if (!offlineStrict) {
+                    val diskPath = withContext(Dispatchers.IO) { audioManager.getCachedTtsPath(clean, voice) }
+                    if (diskPath != null) {
+                        audioManager.ttsUrlCache[cacheKey] = diskPath
+                        handedOff = true
+                        playResolvedAudio(diskPath, text, pitch, speed)
                         return@launch
                     }
                 }
-                return
-            }
-        }
 
-        // Online synthesis (AWS EC2 / swift-worker endpoint)
-        viewModelScope.launch {
-            audioManager.setPlayerLoading(text)
-            val result = apiService.fetchTtsAudioUrl(clean, voice = voice)
-            result.onSuccess { url ->
-                val savedDiskPath = audioManager.saveTtsToDiskCache(clean, voice, url)
-                val finalPath = savedDiskPath ?: url
-                audioManager.ttsUrlCache[cacheKey] = finalPath
-
-                audioManager.playAudioUrl(
-                    url = finalPath,
-                    ttsText = text,
-                    pitch = pitch,
-                    speed = speed
-                )
-            }.onFailure { err ->
-                audioManager.stopPlayback()
-                val friendlyError = when {
-                    err.message?.contains("timeout", ignoreCase = true) == true ->
-                        "Server-a som la-gasino... khebseni try khalamfin salte ⏳"
-                    err.message?.contains("connect", ignoreCase = true) == true || err.message?.contains("network", ignoreCase = true) == true ->
-                        "Internet signal gwiya khuma... wifi aba data check khalam 📡"
-                    else ->
-                        "TTS error: Voice generate khalamnw haya swi. Khebseni try khalamfin."
+                // 3. Offline neural synthesis
+                val useOffline = when (mode) {
+                    "offline" -> true
+                    "auto" -> plan.packInstalled
+                    else -> false
                 }
-                _uiState.value = _uiState.value.copy(errorMessage = friendlyError)
+                if (useOffline) {
+                    if (!plan.packInstalled) {
+                        // Strict offline mode: NEVER call the online service silently.
+                        reportSpeechError("Offline voice pack is not installed. Download it in Settings to enable offline Bodo speech.")
+                        return@launch
+                    }
+                    val outcome = synthesizeOffline(clean, voice, speed)
+                    val speech = outcome.getOrNull()
+                    if (speech != null) {
+                        audioManager.ttsUrlCache[cacheKey] = speech.path
+                        handedOff = true
+                        playResolvedAudio(speech.path, text, pitch, speed)
+                        notifyIfTruncated(speech)
+                        return@launch
+                    }
+                    val failure = describeOfflineFailure(outcome.exceptionOrNull() ?: IllegalStateException("unknown"))
+                    if (offlineStrict) {
+                        reportSpeechError(failure) // strict offline: report, never fall back
+                        return@launch
+                    }
+                    // Auto mode: an explicit, visible fallback that keeps the offline error in front of the user.
+                    reportSpeechError("$failure Using the online voice instead.")
+                }
+
+                // 4. Online synthesis (AWS EC2 / swift-worker endpoint)
+                val result = apiService.fetchTtsAudioUrl(clean, voice = voice)
+                result.onSuccess { url ->
+                    val savedDiskPath = withContext(Dispatchers.IO) { audioManager.saveTtsToDiskCache(clean, voice, url) }
+                    val finalPath = savedDiskPath ?: url
+                    audioManager.ttsUrlCache[cacheKey] = finalPath
+                    handedOff = true
+                    playResolvedAudio(finalPath, text, pitch, speed)
+                }.onFailure { err ->
+                    val friendlyError = when {
+                        err.message?.contains("timeout", ignoreCase = true) == true ->
+                            "Server-a som la-gasino... khebseni try khalamfin salte ⏳"
+                        err.message?.contains("connect", ignoreCase = true) == true || err.message?.contains("network", ignoreCase = true) == true ->
+                            "Internet signal gwiya khuma... wifi aba data check khalam 📡"
+                        else ->
+                            "TTS error: Voice generate khalamnw haya swi. Khebseni try khalamfin."
+                    }
+                    reportSpeechError(friendlyError)
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                reportSpeechError("Speech error: ${e.message ?: e.javaClass.simpleName}")
+            } finally {
+                if (!handedOff && isActive) audioManager.stopPlayback()
             }
         }
     }
@@ -1468,14 +1530,14 @@ class OrkiViewModel(application: Application) : AndroidViewModel(application) {
             liveTalkTranscript = ""
         )
         audioManager.stopRecording()
-        audioManager.stopPlayback()
+        stopSpeech()
     }
 
     fun onLiveTalkOrbTapped() {
         val currentStatus = _uiState.value.liveTalkStatus
         if (currentStatus == LiveTalkStatus.SPEAKING) {
             // Interrupt assistant speech and immediately start listening again
-            audioManager.stopPlayback()
+            stopSpeech()
             startVoiceRecording(liveMode = true)
         } else if (currentStatus == LiveTalkStatus.LISTENING) {
             // Force stop recording early (don't wait for silence timer)
@@ -1484,116 +1546,81 @@ class OrkiViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun speakAndResumeLiveTalk(ttsText: String) {
-        val clean = OrkiApiService.cleanTextForTTS(ttsText)
-        if (clean.isEmpty()) {
-            if (_uiState.value.liveTalkStatus != LiveTalkStatus.IDLE) {
-                startVoiceRecording(liveMode = true)
-            }
-            return
-        }
-
         val voice = _uiState.value.selectedVoice
-        val profile = VoiceOptions.get(voice)
         val speed = prefs.ttsSpeed
         val pitch = prefs.ttsPitch
-        val cacheKey = "$voice:$speed:$clean"
-
-        _uiState.value = _uiState.value.copy(liveTalkStatus = LiveTalkStatus.SPEAKING)
-
-        val cachedUrl = audioManager.ttsUrlCache[cacheKey]
-        if (cachedUrl != null) {
-            audioManager.playAudioUrl(
-                url = cachedUrl,
-                ttsText = ttsText,
-                pitch = pitch,
-                speed = speed
-            ) {
-                if (_uiState.value.liveTalkStatus != LiveTalkStatus.IDLE) {
-                    startVoiceRecording(liveMode = true)
-                }
-            }
-            return
-        }
-
         val mode = prefs.ttsEngineMode
-        val useOffline = when (mode) {
-            "offline" -> true
-            "auto" -> voicePackManager.isVoicePackInstalled()
-            else -> false
-        }
+        val offlineStrict = mode == "offline"
 
-        if (useOffline) {
-            if (!voicePackManager.isVoicePackInstalled()) {
-                if (mode == "offline") {
-                    if (_uiState.value.liveTalkStatus != LiveTalkStatus.IDLE) {
-                        startVoiceRecording(liveMode = true)
-                    }
-                    _uiState.value = _uiState.value.copy(
-                        errorMessage = "Offline voice pack is not installed. Download it in Settings to enable offline Bodo speech."
-                    )
-                    return
+        ttsJob?.cancel()
+        ttsJob = viewModelScope.launch {
+            fun resumeListening() {
+                if (_uiState.value.liveTalkStatus != LiveTalkStatus.IDLE) startVoiceRecording(liveMode = true)
+            }
+            try {
+                val plan = planSpeech(ttsText)
+                val clean = plan.clean
+                if (clean.isEmpty()) {
+                    resumeListening()
+                    return@launch
                 }
-                // In auto mode, fallback to online below
-            } else {
-                viewModelScope.launch {
-                    try {
-                        val engine = getOrInitNeuralEngine()
-                        if (engine != null) {
-                            val outFile = java.io.File(getApplication<Application>().cacheDir, "tts_neural_live_${voice}_${clean.hashCode()}.wav")
-                            val res = engine.synthesizeToWav(clean, voice, speed, outFile)
-                            res.onSuccess { wavPath ->
-                                audioManager.ttsUrlCache[cacheKey] = wavPath
-                                if (_uiState.value.liveTalkStatus != LiveTalkStatus.IDLE) {
-                                    audioManager.playAudioUrl(
-                                        url = wavPath,
-                                        ttsText = ttsText,
-                                        pitch = pitch,
-                                        speed = speed
-                                    ) {
-                                        if (_uiState.value.liveTalkStatus != LiveTalkStatus.IDLE) {
-                                            startVoiceRecording(liveMode = true)
-                                        }
-                                    }
-                                }
-                            }.onFailure {
-                                if (_uiState.value.liveTalkStatus != LiveTalkStatus.IDLE) {
-                                    startVoiceRecording(liveMode = true)
-                                }
-                            }
-                            return@launch
-                        }
-                    } catch (_: Exception) {
-                        if (_uiState.value.liveTalkStatus != LiveTalkStatus.IDLE) {
-                            startVoiceRecording(liveMode = true)
-                        }
+                val cacheKey = "$voice:$speed:$clean"
+                _uiState.value = _uiState.value.copy(liveTalkStatus = LiveTalkStatus.SPEAKING)
+
+                fun play(path: String) {
+                    if (_uiState.value.liveTalkStatus != LiveTalkStatus.IDLE) {
+                        playResolvedAudio(path, ttsText, pitch, speed) { resumeListening() }
+                    }
+                }
+
+                audioManager.ttsUrlCache[cacheKey]?.let { cached ->
+                    if (isCachedAudioUsable(cached, offlineStrict)) {
+                        play(cached)
                         return@launch
                     }
+                    audioManager.ttsUrlCache.remove(cacheKey)
                 }
-                return
-            }
-        }
 
-        // Online LiveTalk synthesis (AWS EC2 / swift-worker)
-        viewModelScope.launch {
-            val res = apiService.fetchTtsAudioUrl(clean, voice = voice)
-            res.onSuccess { url ->
-                audioManager.ttsUrlCache[cacheKey] = url
-                if (_uiState.value.liveTalkStatus != LiveTalkStatus.IDLE) {
-                    audioManager.playAudioUrl(
-                        url = url,
-                        ttsText = ttsText,
-                        pitch = pitch,
-                        speed = speed
-                    ) {
-                        if (_uiState.value.liveTalkStatus != LiveTalkStatus.IDLE) {
-                            startVoiceRecording(liveMode = true)
-                        }
+                val useOffline = when (mode) {
+                    "offline" -> true
+                    "auto" -> plan.packInstalled
+                    else -> false
+                }
+                if (useOffline) {
+                    if (!plan.packInstalled) {
+                        resumeListening()
+                        reportSpeechError("Offline voice pack is not installed. Download it in Settings to enable offline Bodo speech.")
+                        return@launch
                     }
+                    val outcome = synthesizeOffline(clean, voice, speed)
+                    val speech = outcome.getOrNull()
+                    if (speech != null) {
+                        audioManager.ttsUrlCache[cacheKey] = speech.path
+                        play(speech.path)
+                        return@launch
+                    }
+                    val failure = describeOfflineFailure(outcome.exceptionOrNull() ?: IllegalStateException("unknown"))
+                    if (offlineStrict) {
+                        reportSpeechError(failure) // strict offline: report, never fall back
+                        resumeListening()
+                        return@launch
+                    }
+                    reportSpeechError("$failure Using the online voice instead.")
                 }
-            }.onFailure {
-                if (_uiState.value.liveTalkStatus != LiveTalkStatus.IDLE) {
-                    startVoiceRecording(liveMode = true)
+
+                // Online LiveTalk synthesis (AWS EC2 / swift-worker)
+                val res = apiService.fetchTtsAudioUrl(clean, voice = voice)
+                res.onSuccess { url ->
+                    audioManager.ttsUrlCache[cacheKey] = url
+                    play(url)
+                }.onFailure {
+                    resumeListening()
                 }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                reportSpeechError("Speech error: ${e.message ?: e.javaClass.simpleName}")
+                resumeListening()
             }
         }
     }
@@ -1632,7 +1659,6 @@ class OrkiViewModel(application: Application) : AndroidViewModel(application) {
         if (billingManagerDelegate.isInitialized()) {
             billingManager.destroy()
         }
-        neuralEngine?.close()
-        neuralEngine = null
+        discardNeuralEngine()
     }
 }
