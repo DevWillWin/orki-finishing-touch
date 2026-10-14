@@ -448,14 +448,23 @@ fun PerchanceDebugDialog(
                                                 ERROR_BAD_URL -> "Bad URL"
                                                 else -> "ErrorCode $errCode"
                                             }
-                                            addLog(
-                                                LogType.NETWORK_ERROR,
-                                                "NetworkError",
-                                                "[MainFrame=$isMain] $errorTypeStr: $desc (URL: ${PerchanceEndpoints.redact(reqUrl)})"
-                                            )
-                                            val diagnosis = PerchanceErrors.fromWebViewError(errCode, desc, reqUrl, PerchanceStage.WEBVIEW)
-                                            addLog(LogType.INFO, "Diagnosis", "${diagnosis.kind.title} - ${diagnosis.advice}")
-                                            if (isMain) mainFrameError = diagnosis
+                                            if (!isMain && PerchanceEndpoints.isCloudflareChallengeHost(request?.url?.host)) {
+                                                // Cloudflare's check page probes decoy sub-domains that never resolve.
+                                                addLog(
+                                                    LogType.INFO,
+                                                    "CloudflareNoise",
+                                                    "$errorTypeStr on ${request?.url?.host} - expected while Cloudflare's browser check runs; not a real DNS problem."
+                                                )
+                                            } else {
+                                                addLog(
+                                                    LogType.NETWORK_ERROR,
+                                                    "NetworkError",
+                                                    "[MainFrame=$isMain] $errorTypeStr: $desc (URL: ${PerchanceEndpoints.redact(reqUrl)})"
+                                                )
+                                                val diagnosis = PerchanceErrors.fromWebViewError(errCode, desc, reqUrl, PerchanceStage.WEBVIEW)
+                                                addLog(LogType.INFO, "Diagnosis", "${diagnosis.kind.title} - ${diagnosis.advice}")
+                                                if (isMain) mainFrameError = diagnosis
+                                            }
                                         }
 
                                         // HTTP Status Errors (403 Forbidden, 404, 500, 502, Cloudflare Challenges)

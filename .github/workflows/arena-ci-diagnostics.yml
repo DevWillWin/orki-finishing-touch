@@ -194,6 +194,13 @@ jobs:
             done
             echo "== response headers of the Image API page (HEAD, no generation)"
             curl -sS -I --max-time 20 "https://perchance.org/perchance-ai-api" | grep -i -E "^(HTTP|server|cf-mitigated|cf-ray|content-type|x-frame-options|content-security-policy|location)" || true
+            echo "== Pollinations: the exact request shape ImageGenerationService uses (no credentials)"
+            for model in flux turbo; do
+              curl -sS -o "poll_$model.bin" --max-time 90 -w "model=$model http=%{http_code} type=%{content_type} bytes=%{size_download} total=%{time_total}s\n" "https://image.pollinations.ai/prompt/a%20red%20apple?width=512&height=512&nologo=true&model=$model&seed=7" || echo "curl failed rc=$?"
+              printf "magic=%s\n" "$(head -c 4 "poll_$model.bin" | xxd -p)"
+            done
+            echo "== Cloudflare worker without credentials (expects 401, i.e. alive but protected)"
+            curl -sS -o /dev/null --max-time 20 -w "http=%{http_code}\n" -X POST -H "Content-Type: application/json" -d '{"prompt":"x"}' "https://orki-img-gen.devmightwin.workers.dev" || echo "curl failed rc=$?"
             echo "== null.perchance.org stock generator (HEAD)"
             curl -sS -I --max-time 20 "https://null.perchance.org/ai-text-to-image-generator" | grep -i -E "^(HTTP|server|cf-mitigated|location|x-frame-options|content-security-policy)" || true
           } 2>&1 | tee net_facts.log

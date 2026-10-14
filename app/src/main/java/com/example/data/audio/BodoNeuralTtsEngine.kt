@@ -225,7 +225,7 @@ class BodoNeuralTtsEngine(
             logger.warn("init.interrupted", "previous run did not finish marker=$interrupted")
             throw TtsException(
                 TtsErrorKind.PREVIOUS_INTERRUPTION,
-                "The offline voice was interrupted last time (the app may have run out of memory). Free some memory and try again."
+                "The offline voice did not finish last time (the app was closed or ran out of memory). Tap again to retry; if it keeps happening, free some memory or use the online voice."
             )
         }
 

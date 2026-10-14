@@ -203,7 +203,7 @@ class UserPreferences(context: Context) {
         get() = prefs.getString("azure_dalle_deployment", "dall-e-3") ?: "dall-e-3"
         set(value) = prefs.edit().putString("azure_dalle_deployment", value).apply()
 
-    var imageEnginePreference: String // "auto" (Cloudflare -> Pollinations), "azure_dalle" (Azure DALL-E 3 -> Fallbacks)
+    var imageEnginePreference: String // "auto" (Orki Image Studio -> fallbacks), "cloudflare", "perchance" (Perchance AI, visible fallback to Orki Image Studio)
         get() = prefs.getString("image_engine_preference", "auto") ?: "auto"
         set(value) = prefs.edit().putString("image_engine_preference", value).apply()
 

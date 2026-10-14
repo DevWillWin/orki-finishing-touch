@@ -121,6 +121,15 @@ object PerchanceEndpoints {
         return host == "perchance.org" || host.endsWith(".perchance.org") || host == "uploads.dev" || host.endsWith(".uploads.dev")
     }
 
+    /**
+     * Cloudflare's challenge page probes decoy sub-domains of challenges.cloudflare.com that are
+     * *meant* not to resolve. Their `ERR_NAME_NOT_RESOLVED` errors are noise, not a DNS problem.
+     */
+    fun isCloudflareChallengeHost(host: String?): Boolean {
+        val h = host?.lowercase() ?: return false
+        return h == "challenges.cloudflare.com" || h.endsWith(".challenges.cloudflare.com")
+    }
+
     fun hostOf(url: String?): String? = try {
         if (url == null) null else URI(url.trim()).host?.lowercase()
     } catch (_: Exception) {

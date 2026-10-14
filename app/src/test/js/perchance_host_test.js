@@ -125,20 +125,30 @@ t("concurrent requests are tracked independently", () => {
   e.advance(6000); assert.deepStrictEqual(e.calls.errors.map(x => x[0]), ["a"]);
 });
 
-t("warm-up loads perchance.org, reports ok after load, and is cached", () => {
-  const e = makeEnv(); e.window.orkiWarmUp(15000);
+t("warm-up keeps its frame while Cloudflare's challenge runs; native Stop ends it and caches the result", () => {
+  const e = makeEnv(); e.window.orkiWarmUp(25000);
   const f = e.holder.children[0]; assert.strictEqual(f.src, "https://perchance.org");
-  f.onload(); e.advance(500);
-  assert.strictEqual(e.calls.warm.length, 1); assert.strictEqual(e.calls.warm[0][0], true); assert.strictEqual(e.calls.warm[0][1], "loaded");
-  assert.strictEqual(e.holder.children.length, 0);
-  e.window.orkiWarmUp(15000); assert.deepStrictEqual(e.calls.warm[1].slice(0, 2), [true, "cached"]); assert.strictEqual(e.holder.children.length, 0);
+  f.onload(); e.advance(5000);   // first onload = the challenge page itself; tearing down now would abort the check
+  assert.strictEqual(e.holder.children.length, 1, "frame must stay alive until stopped");
+  assert.strictEqual(e.calls.warm.length, 0);
+  f.onload();                     // the page reloads after the challenge completes
+  assert.deepStrictEqual(e.calls.events.filter(x => x[1] === "warmup-frame-loaded").map(x => x[2].split("@")[0]), ["1", "2"]);
+  e.window.orkiWarmUpStop("cleared");
+  assert.deepStrictEqual(e.calls.warm[0].slice(0, 2), [true, "cleared"]); assert.strictEqual(e.holder.children.length, 0);
+  assert.strictEqual(e.pendingTimers(), 0);
+  e.window.orkiWarmUp(25000); assert.deepStrictEqual(e.calls.warm[1].slice(0, 2), [true, "cached"]); assert.strictEqual(e.holder.children.length, 0);
 });
 
-t("warm-up timeout reports failure and is retried next time", () => {
+t("warm-up upper bound reports a timeout and is retried next time", () => {
   const e = makeEnv(); e.window.orkiWarmUp(3000); e.advance(3001);
   assert.deepStrictEqual(e.calls.warm[0].slice(0, 2), [false, "timeout"]); assert.strictEqual(e.holder.children.length, 0);
+  e.window.orkiWarmUpStop("late"); assert.strictEqual(e.calls.warm.length, 1, "stop after the run ended is a no-op");
   e.window.orkiWarmUp(3000); assert.strictEqual(e.holder.children.length, 1); // not marked warmed
   e.window.orkiWarmUp(3000); assert.strictEqual(e.holder.children.length, 1); // already running
+});
+
+t("orkiWarmUpStop without a running warm-up is harmless", () => {
+  const e = makeEnv(); e.window.orkiWarmUpStop("x"); assert.strictEqual(e.calls.warm.length, 0);
 });
 
 console.log("\nall " + n + " JS host-page tests passed");

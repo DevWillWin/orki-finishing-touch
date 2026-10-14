@@ -27,6 +27,9 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.TimeoutCancellationException
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -46,6 +49,7 @@ import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 
@@ -87,8 +91,15 @@ class PerchanceImageEngine(
         const val BASE_URL = "https://perchance.org/"
         private const val HOST_PAGE_ASSET = "perchance_host.html"
         private const val PAGE_READY_TIMEOUT_MS = 10_000L
-        private const val WARM_UP_JS_TIMEOUT_MS = 15_000L
-        private const val WARM_UP_WAIT_MS = 25_000L
+        /** Upper bound for the warm-up: long enough for Cloudflare's automatic (non-interactive) check to finish. */
+        private const val WARM_UP_MAX_MS = 25_000L
+
+        /** Without a clearance cookie and without a challenge the page is considered ready after this. */
+        private const val WARM_UP_UNCHALLENGED_MS = 1_500L
+
+        /** A challenge that has not produced a clearance cookie after this long needs a human (visible browser). */
+        private const val CHALLENGE_GRACE_MS = 40_000L
+        private const val POLL_MS = 400L
         private const val IDLE_RELEASE_MS = 90_000L
         private const val MAX_IMAGE_BYTES = 12L * 1024 * 1024
         private const val MAX_EVENTS = 300
@@ -134,6 +145,9 @@ class PerchanceImageEngine(
 
     @Volatile
     private var run: Run? = null
+
+    /** How many times the warm-up frame finished loading (the 2nd load follows a solved challenge). */
+    private val warmUpLoads = AtomicInteger(0)
 
     @Volatile
     private var runStartedAt = SystemClock.elapsedRealtime()
@@ -264,6 +278,26 @@ class PerchanceImageEngine(
         }
     }
 
+    /** True once Cloudflare has issued this WebView its clearance cookie (shared with the visible debugger). */
+    private suspend fun hasClearanceCookie(): Boolean = withContext(Dispatchers.Main) {
+        try {
+            CookieManager.getInstance().getCookie(PerchanceEndpoints.ORIGIN)?.contains("cf_clearance=") == true
+        } catch (_: Throwable) {
+            false
+        }
+    }
+
+    private fun challengeError(stage: PerchanceStage, waitedMs: Long) = PerchanceException(
+        PerchanceFailureKind.CLOUDFLARE_CHALLENGE, stage, "perchance.org", 403,
+        "Cloudflare's browser check on perchance.org was not completed automatically (waited ${waitedMs / 1000} s)."
+    )
+
+    /**
+     * Visits perchance.org once so Cloudflare can issue its clearance cookie. The hidden frame is held
+     * while a challenge is in progress; the warm-up ends when the cookie appears, when the page loaded
+     * without any challenge, or fails fast with CLOUDFLARE_CHALLENGE when the check never completes
+     * (an interactive check can only be solved in the visible Perchance debugger, which shares cookies).
+     */
     private suspend fun ensureWarmedUp() {
         if (warmedUp) {
             emit("warmup", "already done")
@@ -271,22 +305,38 @@ class PerchanceImageEngine(
         }
         val waiter = CompletableDeferred<WarmUpOutcome>()
         warmUpWaiter = waiter
+        warmUpLoads.set(0)
         val current = Run(PerchanceStage.WARM_UP, waiter)
         run = current
         try {
-            evalJs("orkiWarmUp($WARM_UP_JS_TIMEOUT_MS)")
-            // A network failure on perchance.org itself completes `waiter` exceptionally (fail fast).
-            val outcome = withTimeoutOrNull(WARM_UP_WAIT_MS) { waiter.await() }
-            when {
-                outcome == null -> emit("warmup", "no answer from the page; continuing")
-                outcome.ok -> {
-                    warmedUp = true
-                    emit("warmup", "ok in ${outcome.millis}ms (${outcome.reason})")
+            evalJs("orkiWarmUp($WARM_UP_MAX_MS)")
+            val started = SystemClock.elapsedRealtime()
+            var verdict = "timeout"
+            while (SystemClock.elapsedRealtime() - started < WARM_UP_MAX_MS) {
+                if (waiter.isCompleted) break // page-side timeout, or a fail-fast network error (rethrown below)
+                val elapsed = SystemClock.elapsedRealtime() - started
+                if (hasClearanceCookie()) {
+                    verdict = "cleared"
+                    break
                 }
+                if (warmUpLoads.get() >= 1 && !current.challengeSeen && elapsed >= WARM_UP_UNCHALLENGED_MS) {
+                    verdict = "loaded"
+                    break
+                }
+                delay(POLL_MS)
+            }
+            if (!waiter.isCompleted) evalJs("orkiWarmUpStop(${q(verdict)})")
+            val outcome = withTimeoutOrNull(3_000) { waiter.await() } // rethrows a fail-fast PerchanceException
+            val waited = SystemClock.elapsedRealtime() - started
+            when {
+                verdict == "cleared" || verdict == "loaded" -> {
+                    warmedUp = true
+                    emit("warmup", "ok in ${waited}ms ($verdict)")
+                }
+                current.challengeSeen -> throw challengeError(PerchanceStage.WARM_UP, waited)
                 else -> {
-                    val explanation = current.failures.firstOrNull()
-                    if (explanation != null) throw explanation
-                    emit("warmup", "page did not finish loading (${outcome.reason}); continuing")
+                    current.failures.firstOrNull()?.let { throw it }
+                    emit("warmup", "no clear answer (${outcome?.reason ?: "none"}); continuing")
                 }
             }
         } finally {
@@ -310,7 +360,22 @@ class PerchanceImageEngine(
             evalJs("orkiGenerate(${q(requestId)}, ${q(prompt)}, ${q(resolution)}, ${seed ?: 0}, ${timeoutSeconds * 1000})")
             emit("generate", "waiting (up to ${timeoutSeconds}s)")
             val result = try {
-                withTimeout(timeoutSeconds * 1000 + 15_000) { deferred.await() }
+                withTimeout(timeoutSeconds * 1000 + 15_000) {
+                    coroutineScope {
+                        // If Cloudflare serves a check and no clearance appears, waiting longer is pointless.
+                        val watcher = launch {
+                            delay(CHALLENGE_GRACE_MS)
+                            if (current.challengeSeen && !hasClearanceCookie()) {
+                                deferred.completeExceptionally(challengeError(PerchanceStage.GENERATE, CHALLENGE_GRACE_MS))
+                            }
+                        }
+                        try {
+                            deferred.await()
+                        } finally {
+                            watcher.cancel()
+                        }
+                    }
+                }
             } catch (e: TimeoutCancellationException) {
                 throw timeoutError(current, timeoutSeconds)
             }
@@ -628,6 +693,7 @@ class PerchanceImageEngine(
     private inner class HostBridge {
         @JavascriptInterface
         fun onEvent(id: String, stage: String, detail: String) {
+            if (stage == "warmup-frame-loaded") warmUpLoads.incrementAndGet()
             emit("page:${stage.take(40)}", (if (id.isNotEmpty()) "id=${id.take(8)} " else "") + detail.take(160))
         }
 

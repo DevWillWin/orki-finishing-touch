@@ -76,6 +76,15 @@ class PerchanceProtocolTest {
     }
 
     @Test
+    fun cloudflareChallengeHelperHostsAreRecognisedAsNoise() {
+        assertTrue(PerchanceEndpoints.isCloudflareChallengeHost("brunhild.challenges.cloudflare.com"))
+        assertTrue(PerchanceEndpoints.isCloudflareChallengeHost("challenges.cloudflare.com"))
+        assertFalse(PerchanceEndpoints.isCloudflareChallengeHost("perchance.org"))
+        assertFalse(PerchanceEndpoints.isCloudflareChallengeHost("evilchallenges.cloudflare.com.attacker.net"))
+        assertFalse(PerchanceEndpoints.isCloudflareChallengeHost(null))
+    }
+
+    @Test
     fun redactionNeverKeepsTheQueryWhichCarriesThePrompt() {
         assertEquals(
             "https://perchance.org/perchance-ai-api",

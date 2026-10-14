@@ -65,13 +65,17 @@
   }
 
   // 1) Warm-up (documented): visiting perchance.org lets Cloudflare hand this WebView its clearance cookie.
-  window.orkiWarmUp = function (timeoutMs) {
+  //    The frame is KEPT until the native side calls orkiWarmUpStop(): if Cloudflare serves its managed
+  //    challenge, the frame's first onload is the challenge page itself and tearing the frame down then
+  //    would abort the check before the clearance cookie is issued. maxMs is only the upper bound.
+  var warmUpDone = null;
+  window.orkiWarmUp = function (maxMs) {
     if (warmed) { emit("", "warmup", "already-done"); reportWarmUp(true, "cached", 0); return; }
     if (warmUpRun) { emit("", "warmup", "already-running"); return; }
-    var run = { t0: Date.now(), frame: hiddenFrame(WARM_URL), timer: null, done: false };
+    var run = { t0: Date.now(), frame: hiddenFrame(WARM_URL), timer: null, done: false, loads: 0 };
     warmUpRun = run;
     emit("", "warmup", "start");
-    function done(ok, why) {
+    warmUpDone = function (ok, why) {
       if (run.done) return;
       run.done = true;
       clearTimeout(run.timer);
@@ -79,13 +83,18 @@
       warmUpRun = null;
       if (ok) warmed = true;
       reportWarmUp(ok, why, Date.now() - run.t0);
-    }
-    run.frame.onload = function () {
-      emit("", "warmup-frame-loaded", Date.now() - run.t0);
-      setTimeout(function () { done(true, "loaded"); }, 500);
     };
-    run.timer = setTimeout(function () { done(false, "timeout"); }, Math.max(1000, Number(timeoutMs) || 15000));
+    run.frame.onload = function () {
+      run.loads++;
+      emit("", "warmup-frame-loaded", run.loads + "@" + (Date.now() - run.t0));
+    };
+    run.timer = setTimeout(function () { warmUpDone(false, "timeout"); }, Math.max(1000, Number(maxMs) || 25000));
     holder.appendChild(run.frame);
+  };
+
+  // The native side decides when the warm-up is over (clearance cookie present, or page loaded unchallenged).
+  window.orkiWarmUpStop = function (reason) {
+    if (warmUpRun && warmUpDone) { warmUpDone(true, String(reason || "stopped")); }
   };
 
   // 2) One generation = one hidden iframe + one id.

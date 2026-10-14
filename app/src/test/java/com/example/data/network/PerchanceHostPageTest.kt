@@ -36,7 +36,7 @@ class PerchanceHostPageTest {
         assertTrue(html.contains("perchance-image-api"))
         assertTrue(html.contains("\"format\", \"json\""))
         assertTrue(html.contains("addEventListener(\"message\""))
-        for (symbol in listOf("orkiWarmUp", "orkiGenerate", "orkiCancel", "onImageResult", "onImageError", "onWarmUpDone", "onEvent")) {
+        for (symbol in listOf("orkiWarmUp", "orkiWarmUpStop", "orkiGenerate", "orkiCancel", "onImageResult", "onImageError", "onWarmUpDone", "onEvent")) {
             assertTrue("missing $symbol", html.contains(symbol))
         }
         // The old engine pointed at the stock generator UI with a #prompt= fragment and polled iframe DOMs.
