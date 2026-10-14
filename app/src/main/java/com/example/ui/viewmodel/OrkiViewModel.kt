@@ -11,6 +11,7 @@ import com.example.data.audio.AudioManager
 import com.example.data.audio.BodoNeuralTtsEngine
 import com.example.data.audio.BodoNeuralTtsEngineFactory
 import com.example.data.audio.TtsException
+import com.example.data.audio.TtsRouting
 import com.example.data.audio.AudioPlayerState
 import com.example.data.billing.PlayBillingManager
 import com.example.data.local.AppDatabase
@@ -1434,7 +1435,7 @@ class OrkiViewModel(application: Application) : AndroidViewModel(application) {
         val speed = prefs.ttsSpeed
         val pitch = prefs.ttsPitch
         val mode = prefs.ttsEngineMode // "auto", "offline", "online"
-        val offlineStrict = mode == "offline"
+        val offlineStrict = !TtsRouting.mayUseOnlineCache(mode)
 
         // Newest tap wins. setPlayerLoading() also stops whatever is playing and shows immediate feedback.
         ttsJob?.cancel()
@@ -1461,7 +1462,7 @@ class OrkiViewModel(application: Application) : AndroidViewModel(application) {
                 }
 
                 // 2. Persistent disk cache of online results (never consulted in strict offline mode)
-                if (!offlineStrict) {
+                if (TtsRouting.mayUseOnlineCache(mode)) {
                     val diskPath = withContext(Dispatchers.IO) { audioManager.getCachedTtsPath(clean, voice) }
                     if (diskPath != null) {
                         audioManager.ttsUrlCache[cacheKey] = diskPath
@@ -1471,34 +1472,35 @@ class OrkiViewModel(application: Application) : AndroidViewModel(application) {
                     }
                 }
 
-                // 3. Offline neural synthesis
-                val useOffline = when (mode) {
-                    "offline" -> true
-                    "auto" -> plan.packInstalled
-                    else -> false
-                }
-                if (useOffline) {
-                    if (!plan.packInstalled) {
+                // 3. Offline neural synthesis (routing rules live in TtsRouting and are unit-tested)
+                when (TtsRouting.plan(mode, plan.packInstalled)) {
+                    TtsRouting.Plan.OFFLINE_PACK_MISSING -> {
                         // Strict offline mode: NEVER call the online service silently.
                         reportSpeechError("Offline voice pack is not installed. Download it in Settings to enable offline Bodo speech.")
                         return@launch
                     }
-                    val outcome = synthesizeOffline(clean, voice, speed)
-                    val speech = outcome.getOrNull()
-                    if (speech != null) {
-                        audioManager.ttsUrlCache[cacheKey] = speech.path
-                        handedOff = true
-                        playResolvedAudio(speech.path, text, pitch, speed)
-                        notifyIfTruncated(speech)
-                        return@launch
+                    TtsRouting.Plan.OFFLINE -> {
+                        val outcome = synthesizeOffline(clean, voice, speed)
+                        val speech = outcome.getOrNull()
+                        if (speech != null) {
+                            audioManager.ttsUrlCache[cacheKey] = speech.path
+                            handedOff = true
+                            playResolvedAudio(speech.path, text, pitch, speed)
+                            notifyIfTruncated(speech)
+                            return@launch
+                        }
+                        val failure = describeOfflineFailure(outcome.exceptionOrNull() ?: IllegalStateException("unknown"))
+                        when (TtsRouting.onOfflineFailure(mode)) {
+                            TtsRouting.OfflineFailureAction.REPORT_ONLY -> {
+                                reportSpeechError(failure) // strict offline: report, never fall back
+                                return@launch
+                            }
+                            // Auto mode: an explicit, visible fallback that keeps the offline error in front of the user.
+                            TtsRouting.OfflineFailureAction.REPORT_AND_USE_ONLINE ->
+                                reportSpeechError("$failure Using the online voice instead.")
+                        }
                     }
-                    val failure = describeOfflineFailure(outcome.exceptionOrNull() ?: IllegalStateException("unknown"))
-                    if (offlineStrict) {
-                        reportSpeechError(failure) // strict offline: report, never fall back
-                        return@launch
-                    }
-                    // Auto mode: an explicit, visible fallback that keeps the offline error in front of the user.
-                    reportSpeechError("$failure Using the online voice instead.")
+                    TtsRouting.Plan.ONLINE -> Unit
                 }
 
                 // 4. Online synthesis (AWS EC2 / swift-worker endpoint)
@@ -1564,7 +1566,7 @@ class OrkiViewModel(application: Application) : AndroidViewModel(application) {
         val speed = prefs.ttsSpeed
         val pitch = prefs.ttsPitch
         val mode = prefs.ttsEngineMode
-        val offlineStrict = mode == "offline"
+        val offlineStrict = !TtsRouting.mayUseOnlineCache(mode)
 
         ttsJob?.cancel()
         ttsJob = viewModelScope.launch {
@@ -1595,31 +1597,32 @@ class OrkiViewModel(application: Application) : AndroidViewModel(application) {
                     audioManager.ttsUrlCache.remove(cacheKey)
                 }
 
-                val useOffline = when (mode) {
-                    "offline" -> true
-                    "auto" -> plan.packInstalled
-                    else -> false
-                }
-                if (useOffline) {
-                    if (!plan.packInstalled) {
+                when (TtsRouting.plan(mode, plan.packInstalled)) {
+                    TtsRouting.Plan.OFFLINE_PACK_MISSING -> {
                         resumeListening()
                         reportSpeechError("Offline voice pack is not installed. Download it in Settings to enable offline Bodo speech.")
                         return@launch
                     }
-                    val outcome = synthesizeOffline(clean, voice, speed)
-                    val speech = outcome.getOrNull()
-                    if (speech != null) {
-                        audioManager.ttsUrlCache[cacheKey] = speech.path
-                        play(speech.path)
-                        return@launch
+                    TtsRouting.Plan.OFFLINE -> {
+                        val outcome = synthesizeOffline(clean, voice, speed)
+                        val speech = outcome.getOrNull()
+                        if (speech != null) {
+                            audioManager.ttsUrlCache[cacheKey] = speech.path
+                            play(speech.path)
+                            return@launch
+                        }
+                        val failure = describeOfflineFailure(outcome.exceptionOrNull() ?: IllegalStateException("unknown"))
+                        when (TtsRouting.onOfflineFailure(mode)) {
+                            TtsRouting.OfflineFailureAction.REPORT_ONLY -> {
+                                reportSpeechError(failure) // strict offline: report, never fall back
+                                resumeListening()
+                                return@launch
+                            }
+                            TtsRouting.OfflineFailureAction.REPORT_AND_USE_ONLINE ->
+                                reportSpeechError("$failure Using the online voice instead.")
+                        }
                     }
-                    val failure = describeOfflineFailure(outcome.exceptionOrNull() ?: IllegalStateException("unknown"))
-                    if (offlineStrict) {
-                        reportSpeechError(failure) // strict offline: report, never fall back
-                        resumeListening()
-                        return@launch
-                    }
-                    reportSpeechError("$failure Using the online voice instead.")
+                    TtsRouting.Plan.ONLINE -> Unit
                 }
 
                 // Online LiveTalk synthesis (AWS EC2 / swift-worker)
