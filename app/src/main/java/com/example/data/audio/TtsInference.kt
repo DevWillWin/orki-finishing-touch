@@ -49,7 +49,11 @@ object ModelContractValidator {
     const val SID = "sid"
     const val EMOTION_ID = "emotion_id"
 
-    const val DEFAULT_SAMPLE_RATE = 22050
+    /**
+     * Fallback only when the model carries no `sample_rate` metadata. The pinned real artifact declares
+     * 24000 Hz in its ONNX metadata (its model card says 22050, which is wrong), so that is the safer default.
+     */
+    const val DEFAULT_SAMPLE_RATE = 24000
 
     /**
      * Validates the declared tensors and metadata. Throws [TtsException] (MODEL_INVALID) with a

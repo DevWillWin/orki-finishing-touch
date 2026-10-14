@@ -191,7 +191,7 @@ class BodoNeuralTtsEngineTest {
         assertEquals(r.out(), result.file)
 
         val info = WavFormat.readInfo(r.out())!!
-        assertEquals(22050, info.sampleRate)
+        assertEquals(24000, info.sampleRate)
         assertEquals(1, info.channels)
         assertEquals(16, info.bitsPerSample)
         assertEquals(result.durationMs, info.durationMs)
@@ -230,7 +230,7 @@ class BodoNeuralTtsEngineTest {
 
     @Test
     fun noBlankInterleavingWhenTheModelSaysAddBlankIsOff() {
-        val contract = exporterContract(metadata = mapOf("sample_rate" to "22050", "add_blank" to "0", "n_speakers" to "1024"))
+        val contract = exporterContract(metadata = mapOf("sample_rate" to "24000", "add_blank" to "0", "n_speakers" to "1024"))
         val r = rig(session = { FakeSession(contract) })
         assertTrue(speak(r, text = "आं").isSuccess)
         val req = sessionOf(r).requests.single()
@@ -252,7 +252,7 @@ class BodoNeuralTtsEngineTest {
 
         val info = WavFormat.readInfo(r.out())!!
         val audioSamples = requests.sumOf { it.tokens.size * 100L }
-        val silenceSamples = (requests.size - 1) * (22050L * 220 / 1000) // each chunk ends with a danda
+        val silenceSamples = (requests.size - 1) * (24000L * 220 / 1000) // each chunk ends with a danda
         assertEquals((audioSamples + silenceSamples) * 2, info.dataBytes)
     }
 
@@ -291,7 +291,7 @@ class BodoNeuralTtsEngineTest {
 
     @Test
     fun aSpeakerOutsideTheModelRangeIsRejected() {
-        val contract = exporterContract(metadata = mapOf("sample_rate" to "22050", "add_blank" to "1", "n_speakers" to "5"))
+        val contract = exporterContract(metadata = mapOf("sample_rate" to "24000", "add_blank" to "1", "n_speakers" to "5"))
         val r = rig(session = { FakeSession(contract) })
         assertEquals(TtsErrorKind.INVALID_INPUT, kindOf(speak(r, voice = "male_birphung"))) // speaker 5 >= 5
         assertTrue(speak(r, voice = "female_mainao").isSuccess) // speaker 4 < 5
@@ -338,7 +338,7 @@ class BodoNeuralTtsEngineTest {
         assertTrue((speak(r2).exceptionOrNull() as TtsException).message!!.contains("no audio"))
 
         val r3 = rig(
-            session = { FakeSession(behavior = { _, _ -> FloatArray(22050 * 50) }) },
+            session = { FakeSession(behavior = { _, _ -> FloatArray(24000 * 50) }) },
             limits = BodoNeuralTtsEngine.Limits(maxChunkAudioSeconds = 45)
         )
         assertTrue((speak(r3).exceptionOrNull() as TtsException).message!!.contains("implausibly long"))

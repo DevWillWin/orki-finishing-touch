@@ -26,7 +26,7 @@ class ModelContractValidatorTest {
     }
 
     private val output = listOf(TensorSpec("y", TensorSpec.FLOAT, longArrayOf(-1, 1, -1)))
-    private val meta = mapOf("sample_rate" to "22050", "add_blank" to "1", "n_speakers" to "1024", "num_emotions" to "32")
+    private val meta = mapOf("sample_rate" to "24000", "add_blank" to "1", "n_speakers" to "1024", "num_emotions" to "32")
 
     private fun invalid(inputs: Map<String, TensorSpec>, outputs: List<TensorSpec> = output, metadata: Map<String, String> = meta): TtsException =
         assertThrows(TtsException::class.java) { ModelContractValidator.validate(inputs, outputs, metadata) }
@@ -34,7 +34,7 @@ class ModelContractValidatorTest {
     @Test
     fun acceptsTheDocumentedExporterContract() {
         val c = ModelContractValidator.validate(full(), output, meta)
-        assertEquals(22050, c.sampleRate)
+        assertEquals(24000, c.sampleRate)
         assertTrue(c.addBlank)
         assertEquals(1024, c.numSpeakers)
         assertEquals(32, c.numEmotions)
@@ -101,7 +101,7 @@ class ModelContractValidatorTest {
         assertTrue(c.warnings.any { it.contains("n_speakers") })
 
         val d = ModelContractValidator.validate(full(), output, emptyMap())
-        assertEquals(22050, d.sampleRate)
+        assertEquals(24000, d.sampleRate)
         assertTrue(d.addBlank)
         assertTrue(d.warnings.any { it.contains("sample_rate") })
         assertTrue(d.warnings.any { it.contains("add_blank") })

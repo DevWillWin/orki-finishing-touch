@@ -6,7 +6,7 @@ MatiasLin/sherpa-onnx-vits-rasa-13 (exporter: export_onnx_vits_rasa_13.py) witho
   inputs : x int64 [N,L], x_length int64 [N], noise_scale / length_scale / noise_scale_w float32
            (rank-0 scalars, as exported by `torch.tensor(float)`), sid int64 [N], emotion_id int64 [N]
   output : y float32 [N,1,L]            (one sample per input token)
-  meta   : sample_rate=22050 add_blank=1 n_speakers=1024 num_emotions=32
+  meta   : sample_rate=24000 add_blank=1 n_speakers=1024 num_emotions=32   (24000 = the real artifact's metadata)
 
 y[i] = x[i]*1e-4*length_scale + sid*0.01 + emotion_id*0.02 + noise_scale*0.003
        + noise_scale_w*0.001 + x_length*1e-5
@@ -79,7 +79,7 @@ def build(path, scalar_shape, with_emotion=True, drop_sid=False, extra_input=Fal
     )
     model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
     model.ir_version = 8
-    meta = {"model_type": "vits", "sample_rate": "22050", "add_blank": "1", "n_speakers": "1024"}
+    meta = {"model_type": "vits", "sample_rate": "24000", "add_blank": "1", "n_speakers": "1024"}
     if with_emotion:
         meta["num_emotions"] = "32"
     for k, v in meta.items():

@@ -97,7 +97,9 @@ class RealVoicePackSmokeTest {
             log("scalar shapes: noise_scale=${c.scalarShape("noise_scale").toList()} length_scale=${c.scalarShape("length_scale").toList()} noise_scale_w=${c.scalarShape("noise_scale_w").toList()}")
             log("warnings: ${c.warnings}")
             log("memory after load: ${rssMb()}")
-            assertEquals(22050, c.sampleRate)
+            // The ONNX metadata (written by the exporter from the upstream config) is authoritative: the real
+            // artifact says 24000 Hz while its model card (and the app's old hard-coded constant) say 22050.
+            assertEquals(24000, c.sampleRate)
             assertTrue(c.addBlank)
             assertEquals(1024, c.numSpeakers)
             assertEquals(32, c.numEmotions)
@@ -147,7 +149,7 @@ class RealVoicePackSmokeTest {
                 val result = runBlocking { engine.synthesizeToWav(text, voice, 1.0f, out) }.getOrElse { throw AssertionError("synthesis failed: $it") }
                 val ms = (System.nanoTime() - t0) / 1_000_000
                 val info = WavFormat.readInfo(out)!!
-                assertEquals(22050, info.sampleRate)
+                assertEquals("the WAV header must carry the model's own sample rate", 24000, info.sampleRate)
                 assertEquals(1, info.channels)
                 assertEquals(16, info.bitsPerSample)
                 val pcm = readPcm(out)
@@ -169,6 +171,37 @@ class RealVoicePackSmokeTest {
             val male = f0.getValue("male_birphung")
             assertTrue("could not estimate pitch (female=$female male=$male)", female > 0 && male > 0)
             assertTrue("BRX_F (speaker 4) should be higher pitched than BRX_M (speaker 5): female=$female male=$male", female > male * 1.1)
+        } finally {
+            engine.close()
+            dir.deleteRecursively()
+        }
+    }
+
+    private fun rssKb(field: String): Long = try {
+        File("/proc/self/status").readLines().first { it.startsWith(field) }.replace(Regex("[^0-9]"), "").toLong()
+    } catch (_: Exception) {
+        -1L
+    }
+
+    @Test
+    fun memoryFootprintByStageOnTheRealModel() {
+        System.gc()
+        val base = rssKb("VmRSS:")
+        val dir = Files.createTempDirectory("real-tts-mem").toFile()
+        val engine = BodoNeuralTtsEngine(model, tokens, OrtTtsBackendFactory())
+        try {
+            fun stage(name: String) = log("mem $name: rss=${rssKb("VmRSS:") / 1024}MB (+${(rssKb("VmRSS:") - base) / 1024}MB over baseline) hwm=${rssKb("VmHWM:") / 1024}MB (+${(rssKb("VmHWM:") - base) / 1024}MB)")
+            log("mem baseline: rss=${base / 1024}MB")
+            runBlocking { engine.initialize() }.getOrElse { throw AssertionError("init failed: $it") }
+            stage("after load")
+            val short = "आं नोंखौ मोजां मोन्नाय दान्थि।"
+            runBlocking { engine.synthesizeToWav(short, "female_mainao", 1.0f, File(dir, "a.wav")) }.getOrThrow()
+            stage("after short synthesis")
+            val long = (1..24).joinToString(" ") { short }
+            runBlocking { engine.synthesizeToWav(long, "male_birphung", 1.0f, File(dir, "b.wav")) }.getOrThrow()
+            stage("after long synthesis")
+            repeat(3) { runBlocking { engine.synthesizeToWav(short, "female_mainao", 1.0f, File(dir, "c$it.wav")) }.getOrThrow() }
+            stage("after 3 more")
         } finally {
             engine.close()
             dir.deleteRecursively()

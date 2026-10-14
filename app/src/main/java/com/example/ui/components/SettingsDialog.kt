@@ -418,7 +418,7 @@ fun SettingsDialog(
                                             )
                                             Text(
                                                 text = if (isVoicePackInstalled)
-                                                    "Installed (117 MB) • 22.05 kHz Neural CPU"
+                                                    "Installed (117 MB) • 24 kHz Neural CPU"
                                                 else
                                                     "Not Installed (Required for Offline Mode)",
                                                 fontSize = 10.sp,

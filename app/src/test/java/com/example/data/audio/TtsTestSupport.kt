@@ -45,7 +45,7 @@ internal fun exporterContract(
     scalarRank: Int = 0,
     withEmotion: Boolean = true,
     metadata: Map<String, String> = mapOf(
-        "sample_rate" to "22050", "add_blank" to "1", "n_speakers" to "1024", "num_emotions" to "32"
+        "sample_rate" to "24000", "add_blank" to "1", "n_speakers" to "1024", "num_emotions" to "32"
     )
 ): ModelContract {
     val scalarShape = if (scalarRank == 0) longArrayOf() else longArrayOf(1)

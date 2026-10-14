@@ -43,7 +43,8 @@ data class TtsSynthesisResult(
 
 /**
  * On-device neural speech synthesis for Bodo (बर') — AI4Bharat Rasa VITS (`ai4bharat/vits_rasa_13`)
- * exported to ONNX (22,050 Hz, 16-bit mono output, 1024 speakers / 32 styles; BRX_F=4, BRX_M=5).
+ * exported to ONNX (1024 speakers / 32 styles; BRX_F=4, BRX_M=5). The output sample rate is read from the
+ * model's own metadata (24,000 Hz for the pinned artifact) and written as 16-bit mono PCM.
  *
  * Threading and lifecycle guarantees:
  *  * Every public suspend function switches to [ioDispatcher] first, so nothing heavy — file reads,

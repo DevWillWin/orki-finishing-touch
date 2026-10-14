@@ -54,7 +54,7 @@ class OrtTtsBackendTest {
     fun readsTheContractFromTheLoadedModel() {
         open("tiny_vits_scalar.onnx").use { s ->
             val c = s.contract
-            assertEquals(22050, c.sampleRate)
+            assertEquals(24000, c.sampleRate)
             assertTrue(c.addBlank)
             assertEquals(1024, c.numSpeakers)
             assertEquals(32, c.numEmotions)
@@ -185,7 +185,7 @@ class OrtTtsBackendTest {
                     val result = runBlocking { engine.synthesizeToWav(TestVocab.SHORT_SENTENCE, voice, 1.0f, out) }.getOrThrow()
                     val info = WavFormat.readInfo(out)
                     assertNotNull(info)
-                    assertEquals(22050, info!!.sampleRate)
+                    assertEquals(24000, info!!.sampleRate)
                     assertEquals(1, info.channels)
                     assertEquals(16, info.bitsPerSample)
                     assertEquals(result.durationMs, info.durationMs)
