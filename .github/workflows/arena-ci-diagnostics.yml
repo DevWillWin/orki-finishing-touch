@@ -1,0 +1,149 @@
+name: arena-ci-diagnostics
+
+# TEMPORARY: mirrors the steps of main.yml (unit tests + assembleDebug) on session branches and
+# publishes compile errors / test results as a check-run summary so they can be read through the
+# GitHub API (build logs are not downloadable from the authoring sandbox). Removed before hand-off.
+
+on:
+  push:
+    branches: [ 'arena/**' ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  checks: write
+
+jobs:
+  build:
+    name: Diagnostics build
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java (JDK 21)
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '9.3.1'
+
+      - name: Setup Environment File (.env)
+        run: |
+          if [ -f ".env.example" ] && [ ! -f ".env" ]; then
+            cp .env.example .env
+          fi
+
+      - name: Setup Debug Keystore
+        run: |
+          if [ -f "debug.keystore.base64" ]; then
+            base64 -d debug.keystore.base64 > debug.keystore
+          else
+            keytool -genkeypair -v -keystore debug.keystore \
+              -storepass android -keypass android -alias androiddebugkey \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -dname "CN=Android Debug,O=Android,C=US"
+          fi
+
+      - name: Run unit tests
+        id: tests
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          gradle testDebugUnitTest --stacktrace --no-configuration-cache --console=plain 2>&1 | tee build_tests.log
+
+      - name: Build Debug APK
+        id: assemble
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          gradle assembleDebug --stacktrace --no-configuration-cache --console=plain 2>&1 | tee build_assemble.log
+
+      - name: Publish diagnostics (check-run summary)
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TESTS_OUTCOME: ${{ steps.tests.outcome }}
+          ASSEMBLE_OUTCOME: ${{ steps.assemble.outcome }}
+        run: |
+          python3 - <<'PY'
+          import glob, json, os, subprocess
+          import xml.etree.ElementTree as ET
+
+          def read(path):
+              try:
+                  with open(path, errors="replace") as fh:
+                      return fh.read()
+              except OSError:
+                  return ""
+
+          interesting = []
+          for label, path in (("tests", "build_tests.log"), ("assemble", "build_assemble.log")):
+              for line in read(path).splitlines():
+                  s = line.strip()
+                  if (s.startswith("e: ") or s.startswith("w: file://") and "Perchance" in s
+                          or s.startswith("FAILURE:") or s.startswith("* What went wrong")
+                          or "error:" in s and "Task" not in s or s.startswith("Execution failed")
+                          or s.startswith("BUILD ")):
+                      interesting.append(f"[{label}] {s}")
+          # Keep the line after "What went wrong" because it carries the actual reason.
+          lines = read("build_tests.log").splitlines() + read("build_assemble.log").splitlines()
+          for i, line in enumerate(lines):
+              if line.strip().startswith("* What went wrong"):
+                  interesting.extend("    " + l for l in lines[i + 1:i + 8])
+
+          total = failed = skipped = 0
+          per_class = []
+          problems = []
+          skipped_cases = []
+          for f in sorted(glob.glob("app/build/test-results/testDebugUnitTest/*.xml")):
+              root = ET.parse(f).getroot()
+              t, fl, er, sk = (int(root.get(k, 0)) for k in ("tests", "failures", "errors", "skipped"))
+              total += t; failed += fl + er; skipped += sk
+              per_class.append(f"{root.get('name')}: tests={t} failures={fl + er} skipped={sk} time={root.get('time')}s")
+              for tc in root.iter("testcase"):
+                  for kind in ("failure", "error"):
+                      for e in tc.findall(kind):
+                          problems.append(f"{tc.get('classname')}.{tc.get('name')}: {(e.get('message') or '')[:700]}\n{(e.text or '')[:1800]}")
+                  if tc.find("skipped") is not None:
+                      skipped_cases.append(f"{tc.get('classname')}.{tc.get('name')}")
+
+          tests_outcome = os.environ.get("TESTS_OUTCOME", "?")
+          asm_outcome = os.environ.get("ASSEMBLE_OUTCOME", "?")
+          ok = tests_outcome == "success" and asm_outcome == "success"
+          summary = (
+              f"unit tests step: **{tests_outcome}**; assembleDebug step: **{asm_outcome}**\n\n"
+              f"test cases: {total}, failed: {failed}, skipped: {skipped}\n\n"
+              + "\n".join(f"- {c}" for c in per_class[:60])
+          )
+          text = "## Compile/build diagnostics\n```\n" + "\n".join(interesting[:120]) + "\n```\n"
+          text += "\n## Failing tests\n```\n" + "\n\n".join(problems[:15]) + "\n```\n"
+          text += "\n## Skipped tests\n```\n" + "\n".join(skipped_cases[:40]) + "\n```\n"
+          payload = {
+              "name": "arena-ci-report",
+              "head_sha": os.environ["GITHUB_SHA"],
+              "status": "completed",
+              "conclusion": "success" if ok else "failure",
+              "output": {
+                  "title": f"tests={tests_outcome} assemble={asm_outcome} cases={total} failed={failed} skipped={skipped}",
+                  "summary": summary[:60000],
+                  "text": text[:64000],
+              },
+          }
+          with open("payload.json", "w") as fh:
+              json.dump(payload, fh)
+          subprocess.run(
+              ["gh", "api", "-X", "POST", f"repos/{os.environ['GITHUB_REPOSITORY']}/check-runs", "--input", "payload.json"],
+              check=False, stdout=subprocess.DEVNULL,
+          )
+          PY
+
+      - name: Fail job if build failed
+        if: steps.tests.outcome != 'success' || steps.assemble.outcome != 'success'
+        run: exit 1
