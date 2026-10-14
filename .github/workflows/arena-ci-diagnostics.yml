@@ -51,6 +51,22 @@ jobs:
               -dname "CN=Android Debug,O=Android,C=US"
           fi
 
+      - name: Download real voice pack (pinned revision, verified)
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          DIR="$RUNNER_TEMP/realpack"
+          mkdir -p "$DIR"
+          REV=b5afd4e991e3bdd6195528de650e2ed219d47506
+          BASE="https://huggingface.co/MatiasLin/sherpa-onnx-vits-rasa-13/resolve/$REV"
+          curl -fsSL --retry 3 -o "$DIR/model.onnx" "$BASE/model.onnx"
+          curl -fsSL --retry 3 -o "$DIR/tokens.txt" "$BASE/tokens.txt"
+          echo "4473f8d0b6f738196c1626bbf337cda99b34749b638bb7234c4cb8e1992bf804  $DIR/model.onnx" | sha256sum -c -
+          test "$(stat -c %s "$DIR/model.onnx")" = 123338635
+          test "$(stat -c %s "$DIR/tokens.txt")" = 9556
+          echo "tokens.txt sha256: $(sha256sum "$DIR/tokens.txt" | cut -d' ' -f1)"
+          echo "ORKI_REAL_VOICE_PACK_DIR=$DIR" >> "$GITHUB_ENV"
+
       - name: Run unit tests
         id: tests
         continue-on-error: true
@@ -114,6 +130,12 @@ jobs:
                   if tc.find("skipped") is not None:
                       skipped_cases.append(f"{tc.get('classname')}.{tc.get('name')}")
 
+          real_lines = []
+          for f in sorted(glob.glob("app/build/test-results/testDebugUnitTest/*RealVoicePackSmokeTest*.xml")):
+              root = ET.parse(f).getroot()
+              for so in root.iter("system-out"):
+                  real_lines.extend(l for l in (so.text or "").splitlines() if l.startswith("[real]"))
+
           tests_outcome = os.environ.get("TESTS_OUTCOME", "?")
           asm_outcome = os.environ.get("ASSEMBLE_OUTCOME", "?")
           ok = tests_outcome == "success" and asm_outcome == "success"
@@ -125,6 +147,7 @@ jobs:
           text = "## Compile/build diagnostics\n```\n" + "\n".join(interesting[:120]) + "\n```\n"
           text += "\n## Failing tests\n```\n" + "\n\n".join(problems[:15]) + "\n```\n"
           text += "\n## Skipped tests\n```\n" + "\n".join(skipped_cases[:40]) + "\n```\n"
+          text += "\n## Real voice pack smoke test output\n```\n" + "\n".join(real_lines[:140]) + "\n```\n"
           payload = {
               "name": "arena-ci-report",
               "head_sha": os.environ["GITHUB_SHA"],
