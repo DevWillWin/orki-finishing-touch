@@ -17,6 +17,7 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONObject
 import java.io.File
 import java.io.FileOutputStream
+import java.io.IOException
 import java.net.URLEncoder
 import java.util.UUID
 import java.util.concurrent.TimeUnit
@@ -24,12 +25,35 @@ import java.util.concurrent.TimeUnit
 data class GeneratedImageFile(
     val file: File,
     val engineName: String,
-    val isFallback: Boolean = false
+    val isFallback: Boolean = false,
+    /** Set when an engine tried earlier failed: what went wrong there (never hidden behind a fallback). */
+    val fallbackReason: String? = null
 )
+
+/** One engine's failure, kept so the user sees every attempt instead of a single generic message. */
+data class ProviderFailure(val provider: String, val summary: String, val advice: String? = null)
+
+/** All engines failed; [attempts] lists each one with its own reason, in the order they were tried. */
+class ImageGenerationException(val attempts: List<ProviderFailure>) : Exception(describe(attempts)) {
+    companion object {
+        fun describe(attempts: List<ProviderFailure>): String {
+            if (attempts.isEmpty()) return "Image generation was unable to complete."
+            val lines = attempts.joinToString("\n") { "\u2022 ${it.provider}: ${it.summary}" }
+            val advice = attempts.firstNotNullOfOrNull { it.advice }
+            return if (advice != null) "$lines\nWhat to try: $advice" else lines
+        }
+    }
+}
 
 class ImageGenerationService(private val context: Context) {
 
-    val perchanceEngine by lazy { PerchanceImageEngine(context) }
+    private val perchanceDelegate = lazy { PerchanceImageEngine(context) }
+    val perchanceEngine by perchanceDelegate
+
+    /** Releases the hidden Perchance WebView (if it was ever created). */
+    fun release() {
+        if (perchanceDelegate.isInitialized()) perchanceEngine.release()
+    }
 
     private val httpClient: OkHttpClient = OkHttpClient.Builder()
         .connectTimeout(30, TimeUnit.SECONDS)
@@ -54,7 +78,7 @@ class ImageGenerationService(private val context: Context) {
     suspend fun generateImage(
         prompt: String,
         workerUrl: String = "https://orki-img-gen.devmightwin.workers.dev",
-        apiKey: String = "Orki-Image-7xP6-kQ9m-81vL",
+        apiKey: String = "",
         pollinationsKey: String = "",
         preferredEngine: String = "auto",
         azureEndpoint: String = "",
@@ -63,41 +87,69 @@ class ImageGenerationService(private val context: Context) {
         onStatusUpdate: ((stage: String, isFallback: Boolean) -> Unit)? = null
     ): Result<GeneratedImageFile> = withContext(Dispatchers.IO) {
         val trimmedPrompt = prompt.trim()
-        var cloudflareError: String? = null
+        if (trimmedPrompt.isEmpty()) {
+            return@withContext Result.failure(
+                ImageGenerationException(listOf(ProviderFailure("Prompt", "The image description is empty.", "Type what you want to see, then try again.")))
+            )
+        }
+        val attempts = ArrayList<ProviderFailure>()
+
+        /** A success after an earlier failure carries that failure with it (explicit, not hidden). */
+        fun success(file: File, engineName: String, isFallback: Boolean): Result<GeneratedImageFile> {
+            val reason = attempts.firstOrNull()?.let { "${it.provider}: ${it.summary}" }
+            return Result.success(GeneratedImageFile(file, engineName, isFallback || (preferredEngine == "perchance" && reason != null), reason))
+        }
+
+        fun fail(provider: String, error: Throwable) {
+            val friendly = error as? PerchanceException
+            val summary = friendly?.summary ?: summarize(error)
+            attempts.add(ProviderFailure(provider, summary, friendly?.advice))
+            Log.w("ImageGenerationService", "$provider failed: ${friendly?.kind ?: error.javaClass.simpleName}")
+        }
+
+        // 0. Perchance AI (browser-based, free). Selected explicitly; failures fall back visibly below.
+        if (preferredEngine == "perchance") {
+            onStatusUpdate?.invoke("Generating with Perchance AI...", false)
+            val result = perchanceEngine.generateImage(trimmedPrompt) { event ->
+                when (event.stage) {
+                    "warmup" -> onStatusUpdate?.invoke("Preparing the Perchance browser session...", false)
+                    "generate" -> onStatusUpdate?.invoke("Perchance is drawing your image...", false)
+                    "download" -> onStatusUpdate?.invoke("Downloading artwork from Perchance...", false)
+                }
+            }
+            result.onSuccess { return@withContext Result.success(it) }
+            val error = result.exceptionOrNull() ?: IllegalStateException("unknown")
+            fail("Perchance AI", error)
+            onStatusUpdate?.invoke("Perchance failed (${(error as? PerchanceException)?.kind?.title ?: "error"}). Switching to Orki Image Studio...", true)
+        }
 
         // 1. If user explicitly preferred Cloudflare Workers AI
+        var cloudflareTried = false
         if (preferredEngine == "cloudflare") {
+            cloudflareTried = true
             try {
                 onStatusUpdate?.invoke("Synthesizing with Cloudflare Workers AI...", false)
                 val cfFile = generateWithCloudflareWorker(trimmedPrompt, workerUrl, apiKey)
-                if (cfFile != null) {
-                    return@withContext Result.success(
-                        GeneratedImageFile(
-                            file = cfFile,
-                            engineName = "Cloudflare Workers AI",
-                            isFallback = false
-                        )
-                    )
-                }
+                return@withContext success(cfFile, "Cloudflare Workers AI", false)
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
             } catch (e: Exception) {
-                cloudflareError = e.localizedMessage
-                Log.w("ImageGenerationService", "Cloudflare worker failed: $cloudflareError")
+                fail("Cloudflare Workers AI", e)
                 onStatusUpdate?.invoke("Cloudflare busy. Routing to Orki Image Studio...", true)
             }
         }
 
         // 2. PRIMARY ENGINE: Orki Image Studio (Flux High-Definition Model)
         // High quality 1024x1024, zero-quota, instant 2-4 second response
-        onStatusUpdate?.invoke("Synthesizing artwork with Orki Image Studio (Flux)...", false)
+        onStatusUpdate?.invoke("Synthesizing artwork with Orki Image Studio (Flux)...", preferredEngine == "perchance")
         val fluxResult = generateWithPollinations(
             prompt = trimmedPrompt,
             pollinationsKey = pollinationsKey,
             model = "flux",
             engineName = "Orki Image Studio (Flux)"
         )
-        if (fluxResult.isSuccess) {
-            return@withContext fluxResult
-        }
+        fluxResult.onSuccess { return@withContext success(it.file, it.engineName, it.isFallback) }
+        fail("Orki Image Studio (Flux)", fluxResult.exceptionOrNull() ?: IllegalStateException("unknown"))
 
         // 3. SECONDARY ENGINE (FAST FALLBACK): Orki Turbo Model
         Log.w("ImageGenerationService", "Flux primary failed. Routing to Turbo engine...")
@@ -108,26 +160,19 @@ class ImageGenerationService(private val context: Context) {
             model = "turbo",
             engineName = "Orki Turbo Engine"
         )
-        if (turboResult.isSuccess) {
-            return@withContext turboResult
-        }
+        turboResult.onSuccess { return@withContext success(it.file, it.engineName, it.isFallback) }
+        fail("Orki Turbo Engine", turboResult.exceptionOrNull() ?: IllegalStateException("unknown"))
 
         // 4. TERTIARY FALLBACK: Cloudflare Workers AI (if not already tried)
-        if (preferredEngine != "cloudflare") {
+        if (!cloudflareTried) {
             try {
                 onStatusUpdate?.invoke("Trying Cloudflare Workers AI fallback...", true)
                 val cfFallback = generateWithCloudflareWorker(trimmedPrompt, workerUrl, apiKey)
-                if (cfFallback != null) {
-                    return@withContext Result.success(
-                        GeneratedImageFile(
-                            file = cfFallback,
-                            engineName = "Cloudflare Workers AI (Backup)",
-                            isFallback = true
-                        )
-                    )
-                }
+                return@withContext success(cfFallback, "Cloudflare Workers AI (Backup)", true)
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
             } catch (e: Exception) {
-                cloudflareError = e.localizedMessage
+                fail("Cloudflare Workers AI", e)
             }
         }
 
@@ -138,12 +183,22 @@ class ImageGenerationService(private val context: Context) {
             model = "",
             engineName = "Orki Image Studio"
         )
-        if (standardResult.isSuccess) {
-            return@withContext standardResult
-        }
+        standardResult.onSuccess { return@withContext success(it.file, it.engineName, it.isFallback) }
+        fail("Orki Image Studio", standardResult.exceptionOrNull() ?: IllegalStateException("unknown"))
 
-        val finalMsg = "Image generation was unable to complete. Please check your internet connection and try again."
-        return@withContext Result.failure(Exception(finalMsg))
+        return@withContext Result.failure(ImageGenerationException(attempts))
+    }
+
+    /** One short line for a failure: exception type for network errors, trimmed message otherwise (HTML stripped). */
+    private fun summarize(error: Throwable): String {
+        val classified = when (error) {
+            is java.net.UnknownHostException, is java.net.ConnectException, is java.net.SocketTimeoutException,
+            is javax.net.ssl.SSLException, is java.io.InterruptedIOException -> PerchanceErrors.fromThrowable(error, PerchanceStage.GENERATE, null)
+            else -> null
+        }
+        if (classified != null) return "${classified.kind.title}: ${classified.message}"
+        val text = (error.message ?: error.javaClass.simpleName).replace(Regex("<[^>]*>"), " ").replace(Regex("\\s+"), " ").trim()
+        return text.take(160)
     }
 
     private fun generateWithPollinations(
@@ -168,15 +223,16 @@ class ImageGenerationService(private val context: Context) {
 
             val savedFile: File = httpClient.newCall(pollRequestBuilder.build()).execute().use { response ->
                 if (!response.isSuccessful) {
-                    val pollError = response.body?.string() ?: "HTTP ${response.code}"
-                    throw Exception("Pollinations AI HTTP ${response.code}: $pollError")
+                    val pollError = (response.body?.string() ?: "").replace(Regex("<[^>]*>"), " ").replace(Regex("\\s+"), " ").trim().take(120)
+                    throw IOException("HTTP ${response.code}" + if (pollError.isNotEmpty()) ": $pollError" else "")
                 }
 
                 val imageBytes = response.body?.bytes()
-                    ?: throw Exception("Empty image response from Pollinations AI")
+                    ?: throw IOException("Empty image response")
 
-                val bitmap = BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size)
-                    ?: throw Exception("Could not decode image bytes from Pollinations AI")
+                val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size, bounds)
+                if (bounds.outWidth <= 0) throw IOException("Response was not a decodable image")
 
                 saveToCache(imageBytes, "orki_image")
             }
@@ -198,7 +254,10 @@ class ImageGenerationService(private val context: Context) {
         prompt: String,
         workerUrl: String,
         apiKey: String
-    ): File? {
+    ): File {
+        if (apiKey.isBlank()) {
+            throw IOException("Cloudflare Workers AI is not configured (no API key set).")
+        }
         val json = JSONObject().put("prompt", prompt).toString()
         val effectiveUrl = if (workerUrl.isNotBlank() && workerUrl.contains("workers.dev")) {
             workerUrl
@@ -225,10 +284,16 @@ class ImageGenerationService(private val context: Context) {
             .build()
 
         return fastClient.newCall(request).execute().use { response ->
-            if (!response.isSuccessful) return@use null
-            val imageBytes = response.body?.bytes() ?: return@use null
-            if (imageBytes.isEmpty()) return@use null
-            val bitmap = BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size) ?: return@use null
+            if (!response.isSuccessful) {
+                // Status only: the body may be an HTML error page and the request carried a credential.
+                throw IOException("Cloudflare worker answered HTTP ${response.code}.")
+            }
+            val imageBytes = response.body?.bytes()
+            if (imageBytes == null || imageBytes.isEmpty()) throw IOException("Cloudflare worker returned an empty response.")
+            // Bounds-only decode: validates the image without allocating a full bitmap.
+            val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size, bounds)
+            if (bounds.outWidth <= 0) throw IOException("Cloudflare worker returned data that is not an image.")
             saveToCache(imageBytes, "orki_cf")
         }
     }

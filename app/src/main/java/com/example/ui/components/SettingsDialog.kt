@@ -745,7 +745,7 @@ fun SettingsDialog(
                     SettingsSection(title = "AI IMAGE GENERATION ENGINE") {
                         Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                             // Option 1: Orki Image Studio (Flux / Turbo)
-                            val isFastStudioSelected = imageEngine == "auto" || imageEngine == "perchance" || imageEngine == "pollinations"
+                            val isFastStudioSelected = imageEngine == "auto" || imageEngine == "pollinations"
                             EngineOptionRow(
                                 title = "Orki Image Studio (Flux / Turbo)",
                                 badgeText = "PRIMARY • UNLIMITED FREE",
@@ -762,6 +762,17 @@ fun SettingsDialog(
                                 description = "Fast SDXL/Flux via orki-img-gen worker endpoint",
                                 isSelected = isCfSelected,
                                 onClick = { imageEngine = "cloudflare" }
+                            )
+
+                            // Option 3: Perchance AI (free, browser-based). Failures fall back to Orki Image
+                            // Studio visibly; the "Perchance WebView Debugger" below explains connection problems.
+                            val isPerchanceSelected = imageEngine == "perchance"
+                            EngineOptionRow(
+                                title = "Perchance AI",
+                                badgeText = "FREE • IN-APP BROWSER",
+                                description = "Free unlimited generation through an in-app browser (can take up to a minute). If Perchance is unreachable it tells you why and falls back to Orki Image Studio",
+                                isSelected = isPerchanceSelected,
+                                onClick = { imageEngine = "perchance" }
                             )
 
                             // Multi-Engine Routing Status Pill
@@ -809,7 +820,7 @@ fun SettingsDialog(
                                     Spacer(modifier = Modifier.width(8.dp))
                                     Column {
                                         Text("Perchance WebView Debugger", fontWeight = FontWeight.Medium, fontSize = 11.sp, color = CharcoalTextPrimary)
-                                        Text("Inspect live WebView, DNS, HTTP 403, and JS console", fontSize = 10.sp, color = SlateTextSecondary)
+                                        Text("Network checks (DNS / TCP / TLS / HTTP), test generation, live WebView and JS console", fontSize = 10.sp, color = SlateTextSecondary)
                                     }
                                 }
                                 Box(

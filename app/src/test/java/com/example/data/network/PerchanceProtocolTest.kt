@@ -284,6 +284,24 @@ class PerchanceProtocolTest {
     }
 
     @Test
+    fun aHostThatAnswersWithAnHttpErrorIsStillReachable() {
+        val clock = Clock()
+        val t = StageTracker(clock.source)
+        t.dnsStart(); t.dnsEnd(listOf("1.1.1.1")); t.connectStart(); t.secureConnectStart(); t.secureConnectEnd("TLSv1.3"); t.connectEnd()
+        t.response(401, "cloudflare")
+        val r = t.result("https://orki-img-gen.devmightwin.workers.dev/")
+        assertFalse(r.ok)
+        assertTrue("401 means DNS/TCP/TLS worked", r.reachable)
+
+        val dns = StageTracker(clock.source)
+        dns.dnsStart(); dns.failed(UnknownHostException("x"))
+        assertFalse(dns.result("https://perchance.org/").reachable)
+        val tls = StageTracker(clock.source)
+        tls.dnsStart(); tls.dnsEnd(listOf("1.1.1.1")); tls.connectStart(); tls.secureConnectStart(); tls.failed(SSLHandshakeException("x"))
+        assertFalse(tls.result("https://perchance.org/").reachable)
+    }
+
+    @Test
     fun anHttpErrorStatusIsAFailureAtTheHttpStage() {
         val clock = Clock()
         val t = StageTracker(clock.source)

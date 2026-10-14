@@ -125,7 +125,8 @@ class OrkiViewModel(application: Application) : AndroidViewModel(application) {
     private val apiService by apiServiceDelegate
     private val billingManagerDelegate = lazy { PlayBillingManager(application, viewModelScope) }
     private val billingManager by billingManagerDelegate
-    private val imageService by lazy { ImageGenerationService(application) }
+    private val imageServiceDelegate = lazy { ImageGenerationService(application) }
+    private val imageService by imageServiceDelegate
 
     // AudioManager is cheap to construct; its disk cache is itself lazy (see AudioManager).
     val audioManager = AudioManager(application, viewModelScope)
@@ -858,7 +859,7 @@ class OrkiViewModel(application: Application) : AndroidViewModel(application) {
                         _uiState.value = _uiState.value.copy(
                             imageGenStage = stageText,
                             isImageGenFallback = isFallback,
-                            imageGenEngine = if (isFallback) "Orki Fallback Engine" else if (prefs.imageEnginePreference == "cloudflare") "Cloudflare Workers AI" else "Orki Image Studio (Flux)"
+                            imageGenEngine = if (isFallback) "Orki Fallback Engine" else if (prefs.imageEnginePreference == "cloudflare") "Cloudflare Workers AI" else if (prefs.imageEnginePreference == "perchance") "Perchance AI" else "Orki Image Studio (Flux)"
                         )
                     }
                 )
@@ -873,10 +874,12 @@ class OrkiViewModel(application: Application) : AndroidViewModel(application) {
                     )
                     delay(250)
 
+                    // A fallback never hides why the first engine failed.
+                    val fallbackNote = generated.fallbackReason?.let { "\n\n⚠️ The first engine failed, so a fallback was used.\n$it" } ?: ""
                     val responseText = if (finalPrompt.equals(trimmed, ignoreCase = true)) {
-                        "Here is your generated image for: \"$trimmed\"\n\n🎨 *Rendered via ${generated.engineName}*"
+                        "Here is your generated image for: \"$trimmed\"\n\n🎨 *Rendered via ${generated.engineName}*$fallbackNote"
                     } else {
-                        "Here is your generated image for: \"$trimmed\"\n\n✨ **Enhanced prompt used:**\n$finalPrompt\n\n🎨 *Rendered via ${generated.engineName}*"
+                        "Here is your generated image for: \"$trimmed\"\n\n✨ **Enhanced prompt used:**\n$finalPrompt\n\n🎨 *Rendered via ${generated.engineName}*$fallbackNote"
                     }
 
                     val assistantMessage = ChatMessageEntity(
@@ -914,7 +917,7 @@ class OrkiViewModel(application: Application) : AndroidViewModel(application) {
                         id = UUID.randomUUID().toString(),
                         conversationId = _uiState.value.currentConversationId ?: "",
                         role = "model",
-                        text = "⚠️ Image generation failed: ${error.localizedMessage ?: "Unknown error"}. Both Cloudflare and Pollinations AI were attempted.",
+                        text = "⚠️ Image generation failed.\n${error.localizedMessage ?: "Unknown error"}",
                         timestamp = System.currentTimeMillis()
                     )
                     val finalizedMessages = _uiState.value.messages + assistantError
@@ -928,27 +931,38 @@ class OrkiViewModel(application: Application) : AndroidViewModel(application) {
                         imageGenPrompt = "",
                         isImageGenFallback = false,
                         imageGenEngine = "Orki AI (Cloudflare)",
-                        errorMessage = "Image generation failed: ${error.localizedMessage}"
+                        errorMessage = "Image generation failed: " + (
+                            (error as? com.example.data.network.ImageGenerationException)?.attempts?.firstOrNull()
+                                ?.let { "${it.provider} - ${it.summary}" } ?: (error.localizedMessage ?: "unknown error")
+                        )
                     )
                     persistThread(finalizedMessages)
                 }
             } catch (e: kotlinx.coroutines.CancellationException) {
                 tickerJob.cancel()
+                resetImageGenerationUi() // a cancelled request must never leave the progress card spinning
                 throw e
             } catch (e: Exception) {
                 tickerJob.cancel()
+                resetImageGenerationUi()
                 _uiState.value = _uiState.value.copy(
-                    isGenerating = false,
-                    isThinking = false,
-                    isGeneratingImage = false,
-                    imageGenProgress = 0,
-                    imageGenStage = "",
-                    imageGenPrompt = "",
-                    isImageGenFallback = false,
-                    imageGenEngine = "Orki AI (Cloudflare)"
+                    errorMessage = "Image generation failed: ${e.message ?: e.javaClass.simpleName}"
                 )
             }
         }
+    }
+
+    private fun resetImageGenerationUi() {
+        _uiState.value = _uiState.value.copy(
+            isGenerating = false,
+            isThinking = false,
+            isGeneratingImage = false,
+            imageGenProgress = 0,
+            imageGenStage = "",
+            imageGenPrompt = "",
+            isImageGenFallback = false,
+            imageGenEngine = "Orki AI (Cloudflare)"
+        )
     }
 
     fun generateVideo(prompt: String) {
@@ -1660,5 +1674,6 @@ class OrkiViewModel(application: Application) : AndroidViewModel(application) {
             billingManager.destroy()
         }
         discardNeuralEngine()
+        if (imageServiceDelegate.isInitialized()) imageService.release()
     }
 }

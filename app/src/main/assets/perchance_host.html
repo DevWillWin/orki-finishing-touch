@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Orki Perchance bridge</title>
+</head>
+<body>
+<!--
+  Hidden host page for PerchanceImageEngine. It follows the documented usage of the community
+  "Image API v1" generator (https://perchance.org/perchance-ai-api): a hidden iframe is pointed at
+  <API>?prompt=...&format=json&id=<requestId> and the generator answers with
+  window.postMessage({ api: "perchance-image-api", result: { id, ok, url, dataUrl, seed, error } }).
+
+  Differences from a naive client (each one prevents a real failure mode):
+   * messages are accepted only from perchance.org / *.perchance.org over https AND only for a request id
+     this page issued (any other frame, ad or script is ignored);
+   * every failure path reports to the native side exactly once (result, error, timeout, cancel);
+   * frames are always removed again, on success, failure and cancel.
+  The native side passes plain strings through the AndroidBridge (no JSON parsing on the Kotlin side).
+-->
+<div id="holder"></div>
+<script>
+(function () {
+  "use strict";
+
+  var API_PAGE = "https://perchance.org/perchance-ai-api";
+  var WARM_URL = "https://perchance.org";
+  var holder = document.getElementById("holder");
+  var warmed = false;
+  var warmUpRun = null;
+  var pending = {};
+
+  function bridge() { return window.AndroidBridge || null; }
+
+  function emit(id, stage, detail) {
+    var b = bridge();
+    if (b && b.onEvent) {
+      try { b.onEvent(String(id || ""), String(stage), String(detail == null ? "" : detail)); } catch (e) {}
+    }
+  }
+
+  function hiddenFrame(src) {
+    var f = document.createElement("iframe");
+    f.style.cssText = "width:1px;height:1px;border:0;position:absolute;left:-10px;top:-10px;opacity:0";
+    f.setAttribute("aria-hidden", "true");
+    f.src = src;
+    return f;
+  }
+
+  function removeFrame(f) {
+    try { if (f && f.parentNode) f.parentNode.removeChild(f); } catch (e) {}
+  }
+
+  function allowedOrigin(origin) {
+    return origin === "https://perchance.org" ||
+      /^https:\/\/[a-z0-9-]+(\.[a-z0-9-]+)*\.perchance\.org$/.test(String(origin));
+  }
+
+  function reportWarmUp(ok, why, ms) {
+    var b = bridge();
+    if (b && b.onWarmUpDone) {
+      try { b.onWarmUpDone(!!ok, String(why), Number(ms) || 0); } catch (e) {}
+    }
+  }
+
+  // 1) Warm-up (documented): visiting perchance.org lets Cloudflare hand this WebView its clearance cookie.
+  window.orkiWarmUp = function (timeoutMs) {
+    if (warmed) { emit("", "warmup", "already-done"); reportWarmUp(true, "cached", 0); return; }
+    if (warmUpRun) { emit("", "warmup", "already-running"); return; }
+    var run = { t0: Date.now(), frame: hiddenFrame(WARM_URL), timer: null, done: false };
+    warmUpRun = run;
+    emit("", "warmup", "start");
+    function done(ok, why) {
+      if (run.done) return;
+      run.done = true;
+      clearTimeout(run.timer);
+      removeFrame(run.frame);
+      warmUpRun = null;
+      if (ok) warmed = true;
+      reportWarmUp(ok, why, Date.now() - run.t0);
+    }
+    run.frame.onload = function () {
+      emit("", "warmup-frame-loaded", Date.now() - run.t0);
+      setTimeout(function () { done(true, "loaded"); }, 500);
+    };
+    run.timer = setTimeout(function () { done(false, "timeout"); }, Math.max(1000, Number(timeoutMs) || 15000));
+    holder.appendChild(run.frame);
+  };
+
+  // 2) One generation = one hidden iframe + one id.
+  window.orkiGenerate = function (id, prompt, resolution, seed, timeoutMs) {
+    id = String(id);
+    if (pending[id]) { return; }
+    var params = new URLSearchParams();
+    params.set("prompt", String(prompt));
+    params.set("format", "json");
+    params.set("id", id);
+    params.set("resolution", String(resolution || "768x768"));
+    if (Number(seed) > 0) { params.set("seed", String(Number(seed))); }
+    var rec = { t0: Date.now(), frame: hiddenFrame(API_PAGE + "?" + params.toString()), timer: null };
+    pending[id] = rec;
+    rec.frame.onload = function () { emit(id, "frame-loaded", Date.now() - rec.t0); };
+    rec.timer = setTimeout(function () {
+      settle(id, { ok: false, code: "timeout", error: "no answer after " + Math.round((Date.now() - rec.t0) / 1000) + "s" });
+    }, Math.max(1000, Number(timeoutMs) || 150000));
+    holder.appendChild(rec.frame);
+    emit(id, "frame-requested", "");
+  };
+
+  // 3) Cancel: forget the request and drop its frame; nothing is reported (the native side already gave up).
+  window.orkiCancel = function (id) {
+    id = String(id);
+    var rec = pending[id];
+    if (!rec) { return; }
+    clearTimeout(rec.timer);
+    delete pending[id];
+    removeFrame(rec.frame);
+    emit(id, "cancelled", "");
+  };
+
+  window.addEventListener("message", function (e) {
+    var d = e.data;
+    if (typeof d === "string") {
+      try { d = JSON.parse(d); } catch (x) { return; }
+    }
+    if (!d || typeof d !== "object" || d.api !== "perchance-image-api" || !d.result || typeof d.result !== "object") { return; }
+    var r = d.result;
+    if (typeof r.id !== "string" || !Object.prototype.hasOwnProperty.call(pending, r.id)) { return; }
+    if (!allowedOrigin(e.origin)) { emit(r.id, "message-rejected-origin", e.origin); return; }
+    if (r.ok === true && ((typeof r.url === "string" && r.url) || (typeof r.dataUrl === "string" && r.dataUrl))) {
+      settle(r.id, { ok: true, url: typeof r.url === "string" ? r.url : "", dataUrl: typeof r.dataUrl === "string" ? r.dataUrl : "", seed: r.seed });
+    } else if (r.ok === true) {
+      settle(r.id, { ok: false, code: "protocol", error: "result had neither url nor dataUrl" });
+    } else {
+      settle(r.id, { ok: false, code: "rejected", error: String(r.error || "generation failed").slice(0, 300) });
+    }
+  });
+
+  function settle(id, result) {
+    var rec = pending[id];
+    if (!rec) { return; }
+    clearTimeout(rec.timer);
+    delete pending[id];
+    removeFrame(rec.frame);
+    var b = bridge();
+    if (!b) { return; }
+    try {
+      if (result.ok) {
+        // Only ship the (large) data URL when there is no hosted URL.
+        b.onImageResult(id, result.url, result.url ? "" : result.dataUrl, result.seed == null ? "" : String(result.seed));
+      } else {
+        b.onImageError(id, String(result.code), String(result.error));
+      }
+    } catch (e) {}
+  }
+
+  emit("", "host-ready", "");
+})();
+</script>
+</body>
+</html>

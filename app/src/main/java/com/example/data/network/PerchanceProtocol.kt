@@ -373,6 +373,9 @@ class ProbeResult(
 ) {
     val ok: Boolean get() = failure == null && httpStatus != null && httpStatus < 400
 
+    /** DNS, TCP and TLS all worked and the server answered (even with an HTTP error such as 401/403). */
+    val reachable: Boolean get() = httpStatus != null && (failedStage == null || failedStage == "HTTP")
+
     fun line(): String {
         val sb = StringBuilder(host).append(": ")
         sb.append("DNS ").append(dnsMs?.let { "${it}ms" } ?: if (failedStage == "DNS") "FAILED" else "-")

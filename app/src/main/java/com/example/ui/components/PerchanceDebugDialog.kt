@@ -5,6 +5,7 @@ import android.graphics.Bitmap
 import android.net.http.SslError
 import android.util.Log
 import android.webkit.ConsoleMessage
+import android.webkit.CookieManager
 import android.webkit.SslErrorHandler
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceError
@@ -27,7 +28,9 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -66,6 +69,10 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
+import com.example.data.network.PerchanceEndpoints
+import com.example.data.network.PerchanceErrors
+import com.example.data.network.PerchanceException
+import com.example.data.network.PerchanceStage
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -111,6 +118,7 @@ fun PerchanceDebugDialog(
     var webViewRef by remember { mutableStateOf<WebView?>(null) }
     var pageTitle by remember { mutableStateOf("Initializing...") }
     var loadProgress by remember { mutableIntStateOf(0) }
+    var mainFrameError by remember { mutableStateOf<PerchanceException?>(null) }
     val logs = remember { mutableStateListOf<DebugLogEntry>() }
     val clipboardManager = LocalClipboardManager.current
 
@@ -213,49 +221,87 @@ fun PerchanceDebugDialog(
                     modifier = Modifier
                         .fillMaxWidth()
                         .background(Color(0xFF161E2E))
+                        .horizontalScroll(rememberScrollState())
                         .padding(horizontal = 12.dp, vertical = 6.dp),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Button(
-                        onClick = {
-                            currentUrl = "https://null.perchance.org/ai-text-to-image-generator"
-                            addLog(LogType.INFO, "Navigate", "Loading null.perchance.org URL")
-                            webViewRef?.loadUrl(currentUrl)
-                        },
-                        colors = ButtonDefaults.buttonColors(
-                            containerColor = if (currentUrl.contains("null.perchance.org")) Color(0xFF2563EB) else Color(0xFF1E293B)
-                        ),
-                        shape = RoundedCornerShape(6.dp),
-                        modifier = Modifier.height(28.dp),
-                        contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 8.dp, vertical = 2.dp)
-                    ) {
-                        Text("null.perchance.org", fontSize = 10.sp, color = Color.White)
+                    @Composable
+                    fun ShortcutButton(label: String, selected: Boolean, url: String, logMessage: String) {
+                        Button(
+                            onClick = {
+                                currentUrl = url
+                                addLog(LogType.INFO, "Navigate", logMessage)
+                                selectedTab = 0
+                                webViewRef?.loadUrl(url)
+                            },
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = if (selected) Color(0xFF2563EB) else Color(0xFF1E293B)
+                            ),
+                            shape = RoundedCornerShape(6.dp),
+                            modifier = Modifier.height(28.dp),
+                            contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 8.dp, vertical = 2.dp)
+                        ) {
+                            Text(label, fontSize = 10.sp, color = Color.White)
+                        }
                     }
 
-                    Button(
-                        onClick = {
-                            currentUrl = "https://perchance.org/ai-text-to-image-generator"
-                            addLog(LogType.INFO, "Navigate", "Loading perchance.org main domain URL")
-                            webViewRef?.loadUrl(currentUrl)
-                        },
-                        colors = ButtonDefaults.buttonColors(
-                            containerColor = if (!currentUrl.contains("null.perchance.org")) Color(0xFF2563EB) else Color(0xFF1E293B)
-                        ),
-                        shape = RoundedCornerShape(6.dp),
-                        modifier = Modifier.height(28.dp),
-                        contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 8.dp, vertical = 2.dp)
-                    ) {
-                        Text("perchance.org (root)", fontSize = 10.sp, color = Color.White)
-                    }
-
-                    Spacer(modifier = Modifier.weight(1f))
+                    ShortcutButton(
+                        label = "null.perchance.org",
+                        selected = currentUrl.contains("null.perchance.org"),
+                        url = PerchanceEndpoints.LEGACY_GENERATOR_URL,
+                        logMessage = "Loading null.perchance.org URL"
+                    )
+                    ShortcutButton(
+                        label = "perchance.org (root)",
+                        selected = currentUrl == PerchanceEndpoints.STOCK_GENERATOR_URL,
+                        url = PerchanceEndpoints.STOCK_GENERATOR_URL,
+                        logMessage = "Loading perchance.org main domain URL"
+                    )
+                    ShortcutButton(
+                        label = "Image API page",
+                        selected = currentUrl.contains("perchance-ai-api"),
+                        url = PerchanceEndpoints.API_PAGE + "?prompt=a%20red%20apple&format=html",
+                        logMessage = "Loading the Image API page used by the app (format=html)"
+                    )
 
                     Text(
                         text = "Logs: ${logs.size}",
                         fontSize = 11.sp,
-                        color = Color(0xFF94A3B8),
-                        modifier = Modifier.align(Alignment.CenterVertically)
+                        color = Color(0xFF94A3B8)
                     )
+                }
+
+                // Actionable error banner for a failed main-frame load (DNS / connection / TLS / HTTP ...)
+                mainFrameError?.let { err ->
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .background(Color(0xFF3B1219))
+                            .padding(horizontal = 12.dp, vertical = 8.dp)
+                    ) {
+                        Text(
+                            text = "${err.kind.title}: ${err.message}",
+                            color = Color(0xFFFCA5A5),
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                        Text(
+                            text = err.advice,
+                            color = Color(0xFFE2E8F0),
+                            fontSize = 10.sp,
+                            modifier = Modifier.padding(top = 2.dp)
+                        )
+                        Button(
+                            onClick = { selectedTab = 2 },
+                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFB91C1C)),
+                            shape = RoundedCornerShape(6.dp),
+                            modifier = Modifier.padding(top = 6.dp).height(28.dp),
+                            contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 10.dp, vertical = 2.dp)
+                        ) {
+                            Text("Run network checks", fontSize = 10.sp, color = Color.White)
+                        }
+                    }
                 }
 
                 // Progress Bar
@@ -275,7 +321,7 @@ fun PerchanceDebugDialog(
                     }
                 }
 
-                // Tabs: 0 -> Live WebView, 1 -> Captured Logs
+                // Tabs: 0 -> Live WebView, 1 -> Captured Logs, 2 -> Diagnostics
                 TabRow(
                     selectedTabIndex = selectedTab,
                     containerColor = Color(0xFF121824),
@@ -310,6 +356,11 @@ fun PerchanceDebugDialog(
                             }
                         }
                     )
+                    Tab(
+                        selected = selectedTab == 2,
+                        onClick = { selectedTab = 2 },
+                        text = { Text("Diagnostics", fontSize = 12.sp) }
+                    )
                 }
 
                 // Tab Content
@@ -331,15 +382,15 @@ fun PerchanceDebugDialog(
                                     val s = settings
                                     s.javaScriptEnabled = true
                                     s.domStorageEnabled = true
-                                    s.databaseEnabled = true
                                     s.loadWithOverviewMode = true
                                     s.useWideViewPort = true
                                     s.setSupportZoom(true)
                                     s.builtInZoomControls = true
                                     s.displayZoomControls = false
                                     s.cacheMode = WebSettings.LOAD_DEFAULT
-                                    // Exact user agent string from PerchanceImageEngine.kt
-                                    s.userAgentString = "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Mobile Safari/537.36"
+                                    // Default WebView user agent (same as the engine): a spoofed Chrome version can
+                                    // disagree with the real engine and trip Cloudflare's bot checks.
+                                    CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
 
                                     webChromeClient = object : WebChromeClient() {
                                         override fun onProgressChanged(view: WebView?, newProgress: Int) {
@@ -370,6 +421,7 @@ fun PerchanceDebugDialog(
                                         override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
                                             super.onPageStarted(view, url, favicon)
                                             addLog(LogType.INFO, "Navigation", "Page Started: $url")
+                                            mainFrameError = null
                                         }
 
                                         override fun onPageFinished(view: WebView?, url: String?) {
@@ -399,8 +451,11 @@ fun PerchanceDebugDialog(
                                             addLog(
                                                 LogType.NETWORK_ERROR,
                                                 "NetworkError",
-                                                "[MainFrame=$isMain] $errorTypeStr: $desc (URL: $reqUrl)"
+                                                "[MainFrame=$isMain] $errorTypeStr: $desc (URL: ${PerchanceEndpoints.redact(reqUrl)})"
                                             )
+                                            val diagnosis = PerchanceErrors.fromWebViewError(errCode, desc, reqUrl, PerchanceStage.WEBVIEW)
+                                            addLog(LogType.INFO, "Diagnosis", "${diagnosis.kind.title} - ${diagnosis.advice}")
+                                            if (isMain) mainFrameError = diagnosis
                                         }
 
                                         // HTTP Status Errors (403 Forbidden, 404, 500, 502, Cloudflare Challenges)
@@ -417,8 +472,16 @@ fun PerchanceDebugDialog(
                                             addLog(
                                                 LogType.HTTP_ERROR,
                                                 "HTTP_Error",
-                                                "[MainFrame=$isMain] HTTP $statusCode $reason (URL: $reqUrl)"
+                                                "[MainFrame=$isMain] HTTP $statusCode $reason (URL: ${PerchanceEndpoints.redact(reqUrl)})"
                                             )
+                                            if (isMain && statusCode >= 400) {
+                                                val headers = errorResponse?.responseHeaders ?: emptyMap()
+                                                val diagnosis = PerchanceErrors.fromHttp(
+                                                    statusCode, request?.url?.host, PerchanceStage.WEBVIEW
+                                                ) { name -> headers.entries.firstOrNull { it.key.equals(name, ignoreCase = true) }?.value }
+                                                addLog(LogType.INFO, "Diagnosis", "${diagnosis.kind.title} - ${diagnosis.advice}")
+                                                mainFrameError = diagnosis
+                                            }
                                         }
 
                                         // SSL Certificate Errors
@@ -454,6 +517,14 @@ fun PerchanceDebugDialog(
                                 }
                             },
                             modifier = Modifier.fillMaxSize()
+                        )
+                    }
+
+                    // TAB 2: Network checks + test generation through the production engine
+                    if (selectedTab == 2) {
+                        PerchanceDiagnosticsPanel(
+                            modifier = Modifier.fillMaxSize(),
+                            onLog = { type, tag, message -> addLog(type, tag, message) }
                         )
                     }
 
