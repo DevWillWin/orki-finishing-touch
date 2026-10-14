@@ -130,6 +130,10 @@ jobs:
                   if tc.find("skipped") is not None:
                       skipped_cases.append(f"{tc.get('classname')}.{tc.get('name')}")
 
+          apk = subprocess.run(
+              ["bash", "-c", "ls -la app/build/outputs/apk/debug/*.apk; unzip -l app/build/outputs/apk/debug/*.apk | grep -E 'assets/perchance_host.html|libonnxruntime|classes[0-9]*\\.dex' || true"],
+              capture_output=True, text=True).stdout
+
           real_lines = []
           for f in sorted(glob.glob("app/build/test-results/testDebugUnitTest/*RealVoicePackSmokeTest*.xml")):
               root = ET.parse(f).getroot()
@@ -147,6 +151,7 @@ jobs:
           text = "## Compile/build diagnostics\n```\n" + "\n".join(interesting[:120]) + "\n```\n"
           text += "\n## Failing tests\n```\n" + "\n\n".join(problems[:15]) + "\n```\n"
           text += "\n## Skipped tests\n```\n" + "\n".join(skipped_cases[:40]) + "\n```\n"
+          text += "\n## APK contents (assets + ORT natives)\n```\n" + apk + "\n```\n"
           text += "\n## Real voice pack smoke test output\n```\n" + "\n".join(real_lines[:140]) + "\n```\n"
           payload = {
               "name": "arena-ci-report",
