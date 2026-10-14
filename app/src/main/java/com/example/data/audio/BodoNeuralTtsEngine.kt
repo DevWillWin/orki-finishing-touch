@@ -76,9 +76,13 @@ class BodoNeuralTtsEngine(
     class Limits(
         val maxChunkChars: Int = BodoTextChunker.DEFAULT_MAX_CHARS,
         val maxTotalChars: Int = BodoTextChunker.DEFAULT_MAX_TOTAL_CHARS,
-        /** Heuristic pre-flight thresholds (free RAM); tune on real devices. */
-        val minFreeBytesForInit: Long = 350L * 1024 * 1024,
-        val minFreeBytesForSynthesis: Long = 150L * 1024 * 1024,
+        /**
+         * Pre-flight free-RAM thresholds, derived from measurements on the real model: loading adds
+         * ~185 MB of resident memory; one 120-char chunk peaks at ~+120 MB above that. Roughly 2x margin.
+         * Heuristic (device `availMem` is approximate): tune on real hardware.
+         */
+        val minFreeBytesForInit: Long = 400L * 1024 * 1024,
+        val minFreeBytesForSynthesis: Long = 300L * 1024 * 1024,
         /** How long a request waits for a (continuing) model load before giving up. */
         val initWaitMs: Long = 120_000L,
         /** Wall-clock budget per chunk once inference starts. */

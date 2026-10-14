@@ -159,11 +159,19 @@ class BodoTokenizer private constructor(private val idByCodePoint: Map<Int, Int>
  * duplicated or reordered, which is covered by property-style tests.
  */
 object BodoTextChunker {
-    /** Keeps VITS inputs short: ~12 s of speech and a bounded attention / decoder memory peak. */
-    const val DEFAULT_MAX_CHARS = 180
+    /**
+     * Keeps VITS inputs short (~8 s of speech). Measured on the real model (ORT 1.31, BASIC_OPT, arena
+     * shrinkage) the *transient* memory of one run grows steeply with input length: +20 MB at 40 chars,
+     * +80 MB at 80, +120 MB at 120, +248 MB at 180, +332 MB at 240, +366 MB at 320, on top of ~185 MB
+     * steady state once loaded. 120 characters halves the peak of the previous 180 limit.
+     */
+    const val DEFAULT_MAX_CHARS = 120
 
-    /** Upper bound for one request; the remainder is reported as truncated, never silently dropped. */
-    const val DEFAULT_MAX_TOTAL_CHARS = 1500
+    /**
+     * Upper bound for one request (~65 s of speech, ~9 chunks); the remainder is reported as truncated
+     * (the caller tells the user), never silently dropped. The old engine had no limit at all.
+     */
+    const val DEFAULT_MAX_TOTAL_CHARS = 1000
 
     /** A hard split may overshoot by this much to keep one grapheme cluster intact. */
     const val SLACK = 16

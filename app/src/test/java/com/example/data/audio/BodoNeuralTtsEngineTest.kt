@@ -241,7 +241,7 @@ class BodoNeuralTtsEngineTest {
     fun longTextIsChunkedWithBoundedTokensAndPausesBetweenChunks() {
         val r = rig()
         val sentence = "आं नोंखौ मोजां मोन्नाय दान्थि।"
-        val text = (1..40).joinToString(" ") { sentence }
+        val text = (1..30).joinToString(" ") { sentence } // ~870 chars: under the per-request cap, over many chunks
         val result = speak(r, text = text).getOrThrow()
         val requests = sessionOf(r).requests
         assertTrue(requests.size > 5)
