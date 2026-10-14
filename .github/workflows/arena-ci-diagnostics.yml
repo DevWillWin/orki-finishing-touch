@@ -170,3 +170,124 @@ jobs:
       - name: Fail job if build failed
         if: steps.tests.outcome != 'success' || steps.assemble.outcome != 'success'
         run: exit 1
+
+  live-probe:
+    name: Live Perchance probe (experiment)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Network facts from a neutral vantage point
+        continue-on-error: true
+        run: |
+          {
+            for h in perchance.org null.perchance.org image-generation.perchance.org user.uploads.dev image.pollinations.ai orki-img-gen.devmightwin.workers.dev; do
+              echo "== $h"
+              getent hosts "$h" | head -2 || echo "NO DNS"
+              curl -sS -o /dev/null -I --max-time 20 -w "http=%{http_code} ip=%{remote_ip} dns=%{time_namelookup}s tcp=%{time_connect}s tls=%{time_appconnect}s total=%{time_total}s ssl_verify=%{ssl_verify_result}\n" "https://$h/" || echo "curl failed rc=$?"
+            done
+            echo "== response headers of the Image API page (HEAD, no generation)"
+            curl -sS -I --max-time 20 "https://perchance.org/perchance-ai-api" | grep -i -E "^(HTTP|server|cf-mitigated|cf-ray|content-type|x-frame-options|content-security-policy|location)" || true
+            echo "== null.perchance.org stock generator (HEAD)"
+            curl -sS -I --max-time 20 "https://null.perchance.org/ai-text-to-image-generator" | grep -i -E "^(HTTP|server|cf-mitigated|location|x-frame-options|content-security-policy)" || true
+          } 2>&1 | tee net_facts.log
+
+      - name: Run the real host page in headless Chromium against live Perchance
+        continue-on-error: true
+        env:
+          HOST_HTML: ${{ github.workspace }}/app/src/main/assets/perchance_host.html
+        run: |
+          mkdir -p /tmp/pw && cd /tmp/pw && npm init -y >/dev/null 2>&1
+          npm i playwright >/dev/null 2>&1
+          npx playwright install --with-deps chromium >/dev/null 2>&1
+          cat > probe.js <<'JSEOF'
+          const { chromium } = require('playwright');
+          const fs = require('fs');
+          const html = fs.readFileSync(process.env.HOST_HTML, 'utf8');
+          const log = (...a) => console.log([new Date().toISOString().slice(11, 23), ...a].join(' '));
+          const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+          (async () => {
+            const browser = await chromium.launch({ args: ['--disable-blink-features=AutomationControlled'] });
+            const ctx = await browser.newContext({ viewport: { width: 400, height: 800 } });
+            const page = await ctx.newPage();
+            log('browser', browser.version(), 'ua', await page.evaluate(() => navigator.userAgent));
+            page.on('console', m => { if (['error', 'warning'].includes(m.type())) log('console.' + m.type(), m.text().slice(0, 160)); });
+            page.on('requestfailed', r => log('requestfailed', r.url().split('?')[0], r.failure() && r.failure().errorText));
+            page.on('response', r => { if (r.status() >= 400) { const h = r.headers(); log('http', r.status(), r.url().split('?')[0], 'server=' + (h.server || ''), 'cf-mitigated=' + (h['cf-mitigated'] || '')); } });
+            await page.addInitScript(() => {
+              window.__calls = [];
+              window.AndroidBridge = {
+                onEvent: (id, stage, detail) => window.__calls.push(['event', id, stage, detail]),
+                onWarmUpDone: (ok, why, ms) => window.__calls.push(['warm', ok, why, ms]),
+                onImageResult: (id, url, dataUrl, seed) => window.__calls.push(['result', id, url, dataUrl ? ('dataUrl:' + dataUrl.length) : '', seed]),
+                onImageError: (id, code, msg) => window.__calls.push(['error', id, code, msg]),
+              };
+            });
+            await page.route('https://perchance.org/__orki_host__', route => route.fulfill({ status: 200, contentType: 'text/html; charset=utf-8', body: html }));
+            await page.goto('https://perchance.org/__orki_host__');
+            let drained = 0;
+            const drain = async () => { const calls = await page.evaluate(() => window.__calls); for (; drained < calls.length; drained++) log('bridge', JSON.stringify(calls[drained]).slice(0, 300)); return calls; };
+            await page.evaluate(() => window.orkiWarmUp(15000));
+            const t0 = Date.now();
+            while (Date.now() - t0 < 25000) { const c = await drain(); if (c.some(x => x[0] === 'warm')) break; await sleep(500); }
+            const id = 'live-' + Date.now();
+            await page.evaluate((rid) => window.orkiGenerate(rid, 'a red apple on a wooden table, simple illustration', '768x768', 0, 120000), id);
+            const t1 = Date.now();
+            let lastFrames = '';
+            while (Date.now() - t1 < 130000) {
+              const c = await drain();
+              if (c.some(x => (x[0] === 'result' || x[0] === 'error') && x[1] === id)) break;
+              const frames = page.frames().map(f => f.url().split('?')[0]).join(' | ');
+              if (frames !== lastFrames) { lastFrames = frames; log('frames', frames); }
+              await sleep(1000);
+            }
+            const calls = await drain();
+            const final = calls.find(x => (x[0] === 'result' || x[0] === 'error') && x[1] === id);
+            log('FINAL', JSON.stringify(final || 'NO ANSWER within 130s'), 'elapsed_ms', Date.now() - t1);
+            log('frames at end', page.frames().map(f => f.url().split('?')[0]).join(' | '));
+            if (final && final[0] === 'result' && final[2]) {
+              const resp = await fetch(final[2], { headers: { Referer: 'https://perchance.org/' } });
+              const buf = Buffer.from(await resp.arrayBuffer());
+              log('download', resp.status, resp.headers.get('content-type'), buf.length + ' bytes', 'magic=' + buf.subarray(0, 4).toString('hex'));
+            }
+            await browser.close();
+          })().catch(e => { log('probe crashed', String(e)); process.exit(0); });
+          JSEOF
+          sed -i 's/^          //' probe.js
+          timeout 200 node probe.js 2>&1 | tee "$GITHUB_WORKSPACE/live_probe.log" || true
+
+      - name: Publish live probe (check-run summary)
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 - <<'PY'
+          import json, os, subprocess
+          def read(p):
+              try:
+                  return open(p, errors="replace").read()
+              except OSError:
+                  return "(missing)"
+          net = read("net_facts.log")
+          live = read("live_probe.log")
+          final = [l for l in live.splitlines() if " FINAL " in l or "download" in l]
+          payload = {
+              "name": "arena-live-probe",
+              "head_sha": os.environ["GITHUB_SHA"],
+              "status": "completed",
+              "conclusion": "neutral",
+              "output": {
+                  "title": (final[0][:120] if final else "no FINAL line"),
+                  "summary": "\n".join(final)[:4000] or "no result",
+                  "text": ("## Network facts\n```\n" + net[:20000] + "\n```\n## Headless browser run\n```\n" + live[:40000] + "\n```")[:64000],
+              },
+          }
+          json.dump(payload, open("live_payload.json", "w"))
+          subprocess.run(["gh", "api", "-X", "POST", f"repos/{os.environ['GITHUB_REPOSITORY']}/check-runs", "--input", "live_payload.json"], check=False, stdout=subprocess.DEVNULL)
+          PY

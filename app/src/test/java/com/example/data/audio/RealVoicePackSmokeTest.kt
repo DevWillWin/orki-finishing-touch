@@ -208,6 +208,51 @@ class RealVoicePackSmokeTest {
         }
     }
 
+    /** Resets the kernel's peak-RSS counter (Linux: "5" to clear_refs) so each phase gets its own high-water mark. */
+    private fun resetPeak(): Boolean = try {
+        File("/proc/self/clear_refs").writeText("5")
+        true
+    } catch (_: Exception) {
+        false
+    }
+
+    @Test
+    fun peakMemoryVersusChunkLengthOnTheRealModel() {
+        val dir = Files.createTempDirectory("real-tts-peak").toFile()
+        // chunks are not split here: one long run-on "sentence" per request
+        val engine = BodoNeuralTtsEngine(
+            model, tokens, OrtTtsBackendFactory(),
+            limits = BodoNeuralTtsEngine.Limits(maxChunkChars = 400, maxTotalChars = 1500)
+        )
+        try {
+            runBlocking { engine.initialize() }.getOrElse { throw AssertionError("init failed: $it") }
+            val words = listOf("आं", "नोंखौ", "मोजां", "मोन्नाय", "दान्थि", "नोंनि", "माबोरै")
+            fun textOfLength(n: Int): String {
+                val sb = StringBuilder()
+                var i = 0
+                while (sb.length < n) { if (sb.isNotEmpty()) sb.append(' '); sb.append(words[i++ % words.size]) }
+                return sb.toString().take(n).trimEnd()
+            }
+            val canReset = resetPeak()
+            log("peak counter reset supported: $canReset")
+            for (chars in listOf(40, 80, 120, 180, 240, 320)) {
+                System.gc()
+                val before = rssKb("VmRSS:")
+                resetPeak()
+                val out = File(dir, "p$chars.wav")
+                val t0 = System.nanoTime()
+                val result = runBlocking { engine.synthesizeToWav(textOfLength(chars), "female_mainao", 1.0f, out) }.getOrElse { throw AssertionError("synthesis failed: $it") }
+                val ms = (System.nanoTime() - t0) / 1_000_000
+                val peak = rssKb("VmHWM:")
+                val info = WavFormat.readInfo(out)!!
+                log("peak chars=$chars chunks=${result.chunkCount} audio=${info.durationMs}ms synth=${ms}ms rss_before=${before / 1024}MB peak=${peak / 1024}MB transient=+${(peak - before) / 1024}MB")
+            }
+        } finally {
+            engine.close()
+            dir.deleteRecursively()
+        }
+    }
+
     @Test
     fun longTextIsChunkedAndStaysWithinMemoryOnTheRealModel() {
         val dir = Files.createTempDirectory("real-tts-long").toFile()
