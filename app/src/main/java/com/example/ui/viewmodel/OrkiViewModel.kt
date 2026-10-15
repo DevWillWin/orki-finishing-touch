@@ -241,6 +241,18 @@ class OrkiViewModel(application: Application) : AndroidViewModel(application) {
                 Log.w(STARTUP_TAG, "Optional AI endpoint warm-up failed", error)
             }
         }
+
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                if (voicePackManager.isVoicePackInstalled() && neuralEngine == null) {
+                    Log.i(STARTUP_TAG, "Pre-warming Bodo Neural TTS engine in background...")
+                    getOrInitNeuralEngine()
+                    Log.i(STARTUP_TAG, "Bodo Neural TTS engine ready.")
+                }
+            } catch (error: Throwable) {
+                Log.w(STARTUP_TAG, "Optional Neural TTS pre-warm failed", error)
+            }
+        }
     }
 
     private fun readSavedUiState(): UiState {
@@ -1098,7 +1110,7 @@ class OrkiViewModel(application: Application) : AndroidViewModel(application) {
                 "- 'dwi' (दै) = water, 'onkham' / 'wngkham' (ओंखाम) = cooked rice / meal, 'nokhor' (नखर) = family / household, 'hagra' (हाग्रा) = jungle / forest, 'fwrwng' / 'solong' = teach / learn.\n" +
                 "- Always interpret colloquial Roman Bodo naturally and correctly, respecting authentic Bodo definitions and culture.]"
 
-            val fullConstraints = "$scriptConstraint$bodoKnowledgeBase$livePromptConstraint"
+            val fullConstraints = com.example.data.network.BodoLanguageEngine.buildLanguageConstraints(script, liveMode)
 
             val memoryDepth = when (_uiState.value.currentPlan) {
                 "Guest" -> 4
@@ -1290,15 +1302,15 @@ class OrkiViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    private fun getOrInitNeuralEngine(): com.example.data.audio.BodoNeuralTtsEngine? {
-        if (!voicePackManager.isVoicePackInstalled()) return null
+    private suspend fun getOrInitNeuralEngine(): com.example.data.audio.BodoNeuralTtsEngine? = withContext(Dispatchers.IO) {
+        if (!voicePackManager.isVoicePackInstalled()) return@withContext null
         if (neuralEngine == null) {
             val engine = com.example.data.audio.BodoNeuralTtsEngine(voicePackManager.modelFile, voicePackManager.tokensFile)
             if (engine.initialize()) {
                 neuralEngine = engine
             }
         }
-        return neuralEngine
+        neuralEngine
     }
 
     fun setTtsEngineMode(mode: String) {
@@ -1389,34 +1401,48 @@ class OrkiViewModel(application: Application) : AndroidViewModel(application) {
                 }
                 // In auto mode, fallback to online below
             } else {
-                viewModelScope.launch {
-                    audioManager.setPlayerLoading(text)
+                viewModelScope.launch(Dispatchers.IO) {
+                    withContext(Dispatchers.Main) {
+                        audioManager.setPlayerLoading(text)
+                    }
                     try {
                         val engine = getOrInitNeuralEngine()
                         if (engine != null) {
                             val outFile = java.io.File(getApplication<Application>().cacheDir, "tts_neural_${voice}_${clean.hashCode()}.wav")
                             val res = engine.synthesizeToWav(clean, voice, speed, outFile)
-                            res.onSuccess { wavPath ->
-                                audioManager.ttsUrlCache[cacheKey] = wavPath
-                                audioManager.playAudioUrl(
-                                    url = wavPath,
-                                    ttsText = text,
-                                    pitch = pitch,
-                                    speed = speed
-                                )
-                            }.onFailure { err ->
+                            withContext(Dispatchers.Main) {
+                                res.onSuccess { wavPath ->
+                                    audioManager.ttsUrlCache[cacheKey] = wavPath
+                                    audioManager.playAudioUrl(
+                                        url = wavPath,
+                                        ttsText = text,
+                                        pitch = pitch,
+                                        speed = speed
+                                    )
+                                }.onFailure { err ->
+                                    audioManager.stopPlayback()
+                                    _uiState.value = _uiState.value.copy(
+                                        errorMessage = "Offline TTS error: ${err.message}"
+                                    )
+                                }
+                            }
+                            return@launch
+                        } else {
+                            withContext(Dispatchers.Main) {
                                 audioManager.stopPlayback()
                                 _uiState.value = _uiState.value.copy(
-                                    errorMessage = "Offline TTS error: ${err.message}"
+                                    errorMessage = "Offline voice engine could not be initialized."
                                 )
                             }
                             return@launch
                         }
                     } catch (e: Exception) {
-                        audioManager.stopPlayback()
-                        _uiState.value = _uiState.value.copy(
-                            errorMessage = "Neural TTS error: ${e.message}"
-                        )
+                        withContext(Dispatchers.Main) {
+                            audioManager.stopPlayback()
+                            _uiState.value = _uiState.value.copy(
+                                errorMessage = "Neural TTS error: ${e.message}"
+                            )
+                        }
                         return@launch
                     }
                 }
@@ -1535,36 +1561,40 @@ class OrkiViewModel(application: Application) : AndroidViewModel(application) {
                 }
                 // In auto mode, fallback to online below
             } else {
-                viewModelScope.launch {
+                viewModelScope.launch(Dispatchers.IO) {
                     try {
                         val engine = getOrInitNeuralEngine()
                         if (engine != null) {
                             val outFile = java.io.File(getApplication<Application>().cacheDir, "tts_neural_live_${voice}_${clean.hashCode()}.wav")
                             val res = engine.synthesizeToWav(clean, voice, speed, outFile)
-                            res.onSuccess { wavPath ->
-                                audioManager.ttsUrlCache[cacheKey] = wavPath
-                                if (_uiState.value.liveTalkStatus != LiveTalkStatus.IDLE) {
-                                    audioManager.playAudioUrl(
-                                        url = wavPath,
-                                        ttsText = ttsText,
-                                        pitch = pitch,
-                                        speed = speed
-                                    ) {
-                                        if (_uiState.value.liveTalkStatus != LiveTalkStatus.IDLE) {
-                                            startVoiceRecording(liveMode = true)
+                            withContext(Dispatchers.Main) {
+                                res.onSuccess { wavPath ->
+                                    audioManager.ttsUrlCache[cacheKey] = wavPath
+                                    if (_uiState.value.liveTalkStatus != LiveTalkStatus.IDLE) {
+                                        audioManager.playAudioUrl(
+                                            url = wavPath,
+                                            ttsText = ttsText,
+                                            pitch = pitch,
+                                            speed = speed
+                                        ) {
+                                            if (_uiState.value.liveTalkStatus != LiveTalkStatus.IDLE) {
+                                                startVoiceRecording(liveMode = true)
+                                            }
                                         }
                                     }
-                                }
-                            }.onFailure {
-                                if (_uiState.value.liveTalkStatus != LiveTalkStatus.IDLE) {
-                                    startVoiceRecording(liveMode = true)
+                                }.onFailure {
+                                    if (_uiState.value.liveTalkStatus != LiveTalkStatus.IDLE) {
+                                        startVoiceRecording(liveMode = true)
+                                    }
                                 }
                             }
                             return@launch
                         }
                     } catch (_: Exception) {
-                        if (_uiState.value.liveTalkStatus != LiveTalkStatus.IDLE) {
-                            startVoiceRecording(liveMode = true)
+                        withContext(Dispatchers.Main) {
+                            if (_uiState.value.liveTalkStatus != LiveTalkStatus.IDLE) {
+                                startVoiceRecording(liveMode = true)
+                            }
                         }
                         return@launch
                     }

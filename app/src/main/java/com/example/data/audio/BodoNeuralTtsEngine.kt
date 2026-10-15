@@ -124,8 +124,12 @@ class BodoNeuralTtsEngine(
 
                 val env = OrtEnvironment.getEnvironment()
                 val sessionOptions = OrtSession.SessionOptions().apply {
-                    setIntraOpNumThreads(2)
+                    val cores = Runtime.getRuntime().availableProcessors()
+                    setIntraOpNumThreads(cores.coerceIn(2, 4))
                     setInterOpNumThreads(1)
+                    setOptimizationLevel(OrtSession.SessionOptions.OptLevel.BASIC_OPT)
+                    setMemoryPatternOptimization(true)
+                    setExecutionMode(OrtSession.SessionOptions.ExecutionMode.SEQUENTIAL)
                     try {
                         addConfigEntry("session.disable_telemetry", "1")
                     } catch (_: Throwable) {}
@@ -146,6 +150,8 @@ class BodoNeuralTtsEngine(
 
     /**
      * Synthesizes Bodo text to a WAV audio file on disk.
+     *
+     * Supports sentence-level inference to keep memory footprint compact and avoid ANRs.
      *
      * @param text Normalized Bodo text (Devanagari or normalized via BodoTtsNormalizer)
      * @param voice Voice ID (e.g. "female_mainao" or "male_birphung")
@@ -168,61 +174,78 @@ class BodoNeuralTtsEngine(
             val env = ortEnv ?: return@withContext Result.failure(IllegalStateException("ONNX environment is null"))
 
             try {
-                // 1. Text tokenization
-                val tokens = tokenizeText(text)
-                if (tokens.isEmpty()) {
-                    return@withContext Result.failure(IllegalArgumentException("Text tokenization resulted in 0 tokens"))
-                }
+                // Split long paragraphs by sentence boundaries (। or . or ! or ? or newline)
+                val rawSentences = text.split(Regex("(?<=[।!?.\\n])\\s+"))
+                    .map { it.trim() }
+                    .filter { it.isNotEmpty() }
+                val sentences = if (rawSentences.isEmpty()) listOf(text.trim()) else rawSentences
 
-                // 2. VITS Interleaving with blank (add_blank = 1)
-                val interleaved = LongArray(tokens.size * 2 + 1)
-                for (i in tokens.indices) {
-                    interleaved[i * 2 + 1] = tokens[i].toLong()
-                }
-
-                val seqLen = interleaved.size.toLong()
                 val speakerId = if (voice.contains("male", ignoreCase = true)) SPEAKER_BRX_MALE else SPEAKER_BRX_FEMALE
                 val lengthScale = 1.0f / speed.coerceIn(0.5f, 2.0f)
+                val allSamplesList = ArrayList<FloatArray>(sentences.size)
 
-                // 3. Prepare ONNX input tensors
-                val xTensor = OnnxTensor.createTensor(env, LongBuffer.wrap(interleaved), longArrayOf(1, seqLen))
-                val xLengthTensor = OnnxTensor.createTensor(env, LongBuffer.wrap(longArrayOf(seqLen)), longArrayOf(1))
-                val noiseScaleTensor = OnnxTensor.createTensor(env, FloatBuffer.wrap(floatArrayOf(DEFAULT_NOISE_SCALE)), longArrayOf())
-                val lengthScaleTensor = OnnxTensor.createTensor(env, FloatBuffer.wrap(floatArrayOf(lengthScale)), longArrayOf())
-                val noiseScaleWTensor = OnnxTensor.createTensor(env, FloatBuffer.wrap(floatArrayOf(DEFAULT_NOISE_SCALE_W)), longArrayOf())
-                val sidTensor = OnnxTensor.createTensor(env, LongBuffer.wrap(longArrayOf(speakerId)), longArrayOf(1))
-                val emotionIdTensor = OnnxTensor.createTensor(env, LongBuffer.wrap(longArrayOf(DEFAULT_EMOTION_ID)), longArrayOf(1))
+                for (sentence in sentences) {
+                    val tokens = tokenizeText(sentence)
+                    if (tokens.isEmpty()) continue
 
-                val inputs = mapOf(
-                    "x" to xTensor,
-                    "x_length" to xLengthTensor,
-                    "noise_scale" to noiseScaleTensor,
-                    "length_scale" to lengthScaleTensor,
-                    "noise_scale_w" to noiseScaleWTensor,
-                    "sid" to sidTensor,
-                    "emotion_id" to emotionIdTensor
-                )
+                    // VITS Interleaving with blank (add_blank = 1)
+                    val interleaved = LongArray(tokens.size * 2 + 1)
+                    for (i in tokens.indices) {
+                        interleaved[i * 2 + 1] = tokens[i].toLong()
+                    }
 
-                // 4. Run inference
-                val startTime = System.currentTimeMillis()
-                val results = session.run(inputs)
-                val elapsedMs = System.currentTimeMillis() - startTime
+                    val seqLen = interleaved.size.toLong()
+                    val xTensor = OnnxTensor.createTensor(env, LongBuffer.wrap(interleaved), longArrayOf(1, seqLen))
+                    val xLengthTensor = OnnxTensor.createTensor(env, LongBuffer.wrap(longArrayOf(seqLen)), longArrayOf(1))
+                    val noiseScaleTensor = OnnxTensor.createTensor(env, FloatBuffer.wrap(floatArrayOf(DEFAULT_NOISE_SCALE)), longArrayOf())
+                    val lengthScaleTensor = OnnxTensor.createTensor(env, FloatBuffer.wrap(floatArrayOf(lengthScale)), longArrayOf())
+                    val noiseScaleWTensor = OnnxTensor.createTensor(env, FloatBuffer.wrap(floatArrayOf(DEFAULT_NOISE_SCALE_W)), longArrayOf())
+                    val sidTensor = OnnxTensor.createTensor(env, LongBuffer.wrap(longArrayOf(speakerId)), longArrayOf(1))
+                    val emotionIdTensor = OnnxTensor.createTensor(env, LongBuffer.wrap(longArrayOf(DEFAULT_EMOTION_ID)), longArrayOf(1))
 
-                // 5. Extract output waveform
-                val outputTensor = results[0] as OnnxTensor
-                val floatBuffer = outputTensor.floatBuffer
-                val numSamples = floatBuffer.remaining()
-                val samples = FloatArray(numSamples)
-                floatBuffer.get(samples)
+                    val inputs = mapOf(
+                        "x" to xTensor,
+                        "x_length" to xLengthTensor,
+                        "noise_scale" to noiseScaleTensor,
+                        "length_scale" to lengthScaleTensor,
+                        "noise_scale_w" to noiseScaleWTensor,
+                        "sid" to sidTensor,
+                        "emotion_id" to emotionIdTensor
+                    )
 
-                logDebug("Neural synthesis complete: $numSamples samples in ${elapsedMs}ms (${numSamples / 22050f}s audio)")
+                    try {
+                        val results = session.run(inputs)
+                        try {
+                            val outputTensor = results[0] as OnnxTensor
+                            val floatBuffer = outputTensor.floatBuffer
+                            val numSamples = floatBuffer.remaining()
+                            val chunkSamples = FloatArray(numSamples)
+                            floatBuffer.get(chunkSamples)
+                            allSamplesList.add(chunkSamples)
+                        } finally {
+                            results.close()
+                        }
+                    } finally {
+                        inputs.values.forEach { tensor ->
+                            try { tensor.close() } catch (_: Throwable) {}
+                        }
+                    }
+                }
 
-                // Clean up tensors
-                inputs.values.forEach { it.close() }
-                results.close()
+                if (allSamplesList.isEmpty()) {
+                    return@withContext Result.failure(IllegalArgumentException("Text tokenization resulted in 0 synthesizable samples"))
+                }
 
-                // 6. Write to standard 16-bit PCM WAV
-                writePcmToWavFile(samples, SAMPLE_RATE, outputFile)
+                val totalSamples = allSamplesList.sumOf { it.size }
+                val combinedSamples = FloatArray(totalSamples)
+                var offset = 0
+                for (chunk in allSamplesList) {
+                    System.arraycopy(chunk, 0, combinedSamples, offset, chunk.size)
+                    offset += chunk.size
+                }
+
+                writePcmToWavFile(combinedSamples, SAMPLE_RATE, outputFile)
+                logDebug("Neural synthesis complete: $totalSamples samples (${totalSamples / 22050f}s audio)")
 
                 Result.success(outputFile.absolutePath)
             } catch (e: Exception) {
